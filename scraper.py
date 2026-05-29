@@ -216,13 +216,17 @@ def fetch_thread(subreddit: str, post_id: str, session: requests.Session) -> tup
         for node in nodes:
             if not isinstance(node, dict):
                 continue
+            # Arctic Shift returns Reddit-style wrapper nodes with kind/data
             if node.get("kind") == "more":
                 continue
+            if "data" in node and isinstance(node["data"], dict):
+                node = node["data"]
             cid = node.get("id")
             if cid:
                 comments_by_id[cid] = node
-            # Recurse into replies (can be a list or absent)
             replies = node.get("replies") or []
+            if isinstance(replies, dict):
+                replies = replies.get("data", {}).get("children", [])
             if isinstance(replies, list):
                 walk_tree(replies)
 
