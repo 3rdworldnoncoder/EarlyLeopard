@@ -45,7 +45,8 @@ log = logging.getLogger(__name__)
 # Arctic Shift — comments
 # ---------------------------------------------------------------------------
 
-ARCTIC_FIELDS = "id,author,body,created_utc,subreddit,score,parent_id,link_id"
+ARCTIC_COMMENT_FIELDS = "id,author,body,created_utc,subreddit,score,parent_id,link_id"
+ARCTIC_POST_FIELDS    = "id,author,title,selftext,url,created_utc,subreddit,score,num_comments"
 
 
 def iter_arctic_comments(known_ids: set, full: bool, session: requests.Session):
@@ -60,7 +61,7 @@ def iter_arctic_comments(known_ids: set, full: bool, session: requests.Session):
             "author": REDDIT_USERNAME,
             "limit":  100,
             "sort":   "asc",
-            "fields": ARCTIC_FIELDS,
+            "fields": ARCTIC_COMMENT_FIELDS,
         }
         if after:
             params["after"] = after
@@ -118,6 +119,71 @@ def map_comment(item: dict) -> dict:
         "parent_id":   item.get("parent_id"),
         "link_id":     item.get("link_id"),
         "captured_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def iter_arctic_posts(known_ids: set, full: bool, session: requests.Session):
+    """Yields raw post dicts from Arctic Shift."""
+    after = None
+    while True:
+        params = {
+            "author": REDDIT_USERNAME,
+            "limit":  100,
+            "sort":   "asc",
+            "fields": ARCTIC_POST_FIELDS,
+        }
+        if after:
+            params["after"] = after
+
+        log.info("Arctic Shift: fetching posts (after=%s)", after or "start")
+        try:
+            resp = session.get(f"{ARCTIC_BASE}/api/posts/search", params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json().get("data", [])
+        except Exception as e:
+            log.warning("Arctic Shift posts request failed: %s", e)
+            break
+
+        if not data:
+            log.info("Arctic Shift: no more posts.")
+            break
+
+        new_count = 0
+        for item in data:
+            if item.get("id") not in known_ids:
+                yield item
+                new_count += 1
+
+        log.info("  got %d posts, %d new.", len(data), new_count)
+
+        if not full and new_count == 0:
+            log.info("Arctic Shift: all posts already known — stopping.")
+            break
+
+        if len(data) < 100:
+            log.info("Arctic Shift: reached end of post history.")
+            break
+
+        after = str(int(data[-1].get("created_utc", 0)) + 1)
+        time.sleep(REQUEST_DELAY)
+
+
+def map_post(item: dict) -> dict:
+    pid       = item.get("id", "")
+    subreddit = item.get("subreddit", "")
+    permalink = f"/r/{subreddit}/comments/{pid}/" if pid else None
+    return {
+        "id":           pid,
+        "author":       item.get("author"),
+        "title":        item.get("title"),
+        "selftext":     item.get("selftext"),
+        "url":          item.get("url"),
+        "created_utc":  int(item["created_utc"]) if item.get("created_utc") is not None else None,
+        "subreddit":    subreddit,
+        "permalink":    permalink,
+        "score":        item.get("score"),
+        "num_comments": item.get("num_comments"),
+        "captured_at":  datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -179,7 +245,8 @@ def fetch_all_context(
         if post_id:
             post_map.setdefault(post_id, []).append(c)
 
-    posts_to_fetch = set(post_map.keys()) if full else {p for p in post_map if p not in known_post_ids}
+    # Always skip already-archived posts unless reindex_context is set
+    posts_to_fetch = set(post_map.keys()) if full == 'reindex' else {p for p in post_map if p not in known_post_ids}
     log.info("Fetching context for %d unique posts...", len(posts_to_fetch))
 
     post_ctx_rows:     list[dict] = []
@@ -270,20 +337,27 @@ def upsert_in_chunks(supabase: Client, table: str, rows: list[dict], chunk: int 
 # Main
 # ---------------------------------------------------------------------------
 
-def run(full: bool):
+def run(full: bool, reindex_context: bool = False):
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     session  = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
 
-    mode = "FULL BACKFILL" if full else "INCREMENTAL"
+    # mode string for logging
+    if reindex_context:
+        mode = "REINDEX CONTEXT"
+    elif full:
+        mode = "FULL BACKFILL"
+    else:
+        mode = "INCREMENTAL"
     log.info("=== Early Leopard scraper — %s ===", mode)
 
     # ---- Comments (Arctic Shift) ----
     known_comment_ids = get_existing_ids(supabase, "reddit_comments")
     new_comments: list[dict] = []
 
-    for item in iter_arctic_comments(known_comment_ids, full, session):
-        new_comments.append(item)
+    if not reindex_context:
+        for item in iter_arctic_comments(known_comment_ids, full, session):
+            new_comments.append(item)
 
     n = upsert_in_chunks(supabase, "reddit_comments", [map_comment(c) for c in new_comments])
     log.info("Comments upserted: %d", n)
@@ -295,16 +369,15 @@ def run(full: bool):
     # Load all stored comments for context resolution
     stored = supabase.table("reddit_comments").select("id,subreddit,link_id,parent_id").execute().data or []
 
-    if full:
-        # Re-fetch context for every comment in the database
-        all_for_ctx = stored
-    else:
-        # Only fetch context for comments whose post context is missing
-        all_for_ctx = [c for c in stored if c.get("link_id", "").removeprefix("t3_") not in known_post_ctx_ids]
-        all_for_ctx += new_comments
+    # --reindex-context: force re-fetch all contexts; otherwise skip already-known posts
+    ctx_mode = 'reindex' if reindex_context else False
+    all_for_ctx = stored if reindex_context else (
+        [c for c in stored if c.get("link_id", "").removeprefix("t3_") not in known_post_ctx_ids]
+        + new_comments
+    )
 
     post_ctx_rows, comment_ctx_rows = fetch_all_context(
-        all_for_ctx, known_post_ctx_ids, known_comment_ctx_ids, full, session
+        all_for_ctx, known_post_ctx_ids, known_comment_ctx_ids, ctx_mode, session
     )
 
     n_posts = upsert_in_chunks(supabase, "reddit_post_context",    post_ctx_rows)
@@ -312,11 +385,22 @@ def run(full: bool):
     log.info("Post context upserted: %d", n_posts)
     log.info("Comment context upserted: %d", n_ctxc)
 
+    # ---- Posts (submitted) ----
+    known_post_ids = get_existing_ids(supabase, "reddit_posts")
+    new_posts: list[dict] = []
+
+    for item in iter_arctic_posts(known_post_ids, full, session):
+        new_posts.append(item)
+
+    n = upsert_in_chunks(supabase, "reddit_posts", [map_post(p) for p in new_posts])
+    log.info("Posts upserted: %d", n)
+
     log.info("=== Done. ===")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Early Leopard Reddit scraper")
-    parser.add_argument("--full", action="store_true", help="Full backfill")
+    parser.add_argument("--full",             action="store_true", help="Full backfill (all comments, missing context only)")
+    parser.add_argument("--reindex-context",  action="store_true", help="Re-fetch ALL thread context regardless of what's stored")
     args = parser.parse_args()
-    run(args.full)
+    run(full=args.full, reindex_context=args.reindex_context)
