@@ -18,9 +18,11 @@ import sys
 import time
 from datetime import datetime, timezone
 
+import httpx
 import requests
 from dotenv import load_dotenv
-from supabase import create_client, Client
+from supabase import Client, create_client
+from supabase.lib.client_options import SyncClientOptions
 
 # ---------------------------------------------------------------------------
 # Config
@@ -252,11 +254,13 @@ def fetch_all_context(
     known_ctx_comment_ids: set,
     full: bool,
     session: requests.Session,
+    refresh_ctx_comment_ids: set[str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """
     For each unique post referenced by comments, fetch thread context.
     Returns (post_context_rows, comment_context_rows).
     """
+    refresh_ctx_comment_ids = refresh_ctx_comment_ids or set()
     post_map: dict[str, list[dict]] = {}
     for c in comments:
         post_id = c.get("link_id", "").removeprefix("t3_")
@@ -314,7 +318,7 @@ def fetch_all_context(
                 if ancestor_id in seen_in_thread:
                     break
                 seen_in_thread.add(ancestor_id)
-                if not full and ancestor_id in known_ctx_comment_ids:
+                if not full and ancestor_id in known_ctx_comment_ids and ancestor_id not in refresh_ctx_comment_ids:
                     # Already stored — but still need to follow chain upward
                     ancestor = comments_by_id.get(ancestor_id)
                     current_parent = ancestor.get("parent_id", "") if ancestor else ""
@@ -355,6 +359,21 @@ def get_existing_ids(supabase: Client, table: str) -> set:
         offset += page
     log.info("  %d IDs loaded.", len(ids))
     return ids
+
+
+def get_null_parent_context_comment_ids(supabase: Client) -> tuple[set[str], set[str]]:
+    log.info("Loading reddit_comment_context rows with NULL parent_id...")
+    resp = (
+        supabase.table("reddit_comment_context")
+        .select("id,post_id")
+        .is_("parent_id", None)
+        .execute()
+    )
+    rows = resp.data or []
+    ids = {r["id"] for r in rows}
+    post_ids = {r["post_id"] for r in rows if r.get("post_id")}
+    log.info("  %d null-parent comment context rows found.", len(ids))
+    return ids, post_ids
 
 
 def upsert_in_chunks(supabase: Client, table: str, rows: list[dict], chunk: int = 100) -> int:
@@ -399,19 +418,41 @@ def run(full: bool, reindex_context: bool = False):
     # ---- Thread context (Reddit JSON) ----
     known_post_ctx_ids    = get_existing_ids(supabase, "reddit_post_context")
     known_comment_ctx_ids = get_existing_ids(supabase, "reddit_comment_context")
+    null_parent_ctx_ids, null_parent_post_ids = get_null_parent_context_comment_ids(supabase)
 
     # Load all stored comments for context resolution
     stored = supabase.table("reddit_comments").select("id,subreddit,link_id,parent_id").execute().data or []
 
     # --reindex-context: force re-fetch all contexts; otherwise skip already-known posts
     ctx_mode = 'reindex' if reindex_context else False
-    all_for_ctx = stored if reindex_context else (
-        [c for c in stored if c.get("link_id", "").removeprefix("t3_") not in known_post_ctx_ids]
-        + new_comments
-    )
+    if reindex_context:
+        all_for_ctx = stored
+    else:
+        posts_to_refresh = {
+            c.get("link_id", "").removeprefix("t3_")
+            for c in stored
+            if c.get("link_id", "").removeprefix("t3_") not in known_post_ctx_ids
+            or c.get("link_id", "").removeprefix("t3_") in null_parent_post_ids
+        }
+        comment_ids_seen = set()
+        all_for_ctx = []
+        for c in stored + new_comments:
+            cid = c.get("id")
+            if not cid or cid in comment_ids_seen:
+                continue
+            post_id = c.get("link_id", "").removeprefix("t3_")
+            if post_id and post_id in posts_to_refresh:
+                all_for_ctx.append(c)
+                comment_ids_seen.add(cid)
+        all_for_ctx.extend([c for c in new_comments if c.get("id") not in comment_ids_seen])
 
     post_ctx_rows, comment_ctx_rows = fetch_all_context(
-        all_for_ctx, known_post_ctx_ids, known_comment_ctx_ids, ctx_mode, session
+        all_for_ctx,
+        known_post_ctx_ids,
+        known_comment_ctx_ids,
+        ctx_mode,
+        session,
+        refresh_ctx_comment_ids=null_parent_ctx_ids,
     )
 
     n_posts = upsert_in_chunks(supabase, "reddit_post_context",    post_ctx_rows)
