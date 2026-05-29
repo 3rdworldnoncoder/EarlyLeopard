@@ -70,6 +70,7 @@ create table if not exists reddit_comment_context (
     created_utc  bigint,
     post_id      text references reddit_post_context(id),
     permalink    text,
+    parent_id    text,
     captured_at  timestamptz default now()
 );
 
