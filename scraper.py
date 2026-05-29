@@ -325,6 +325,7 @@ def fetch_all_context(
                     "created_utc": int(ancestor["created_utc"]) if ancestor.get("created_utc") is not None else None,
                     "post_id":     post_id,
                     "permalink":   ancestor.get("permalink"),
+                    "parent_id":   ancestor.get("parent_id"),
                     "captured_at": now,
                 })
                 current_parent = ancestor.get("parent_id", "")
