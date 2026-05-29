@@ -32,7 +32,6 @@ SUPABASE_KEY   = os.environ["SUPABASE_KEY"]
 REDDIT_USERNAME = "Early-Leopard-8351"
 USER_AGENT      = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 ARCTIC_BASE     = "https://arctic-shift.photon-reddit.com"
-REDDIT_BASE     = "https://old.reddit.com"
 REQUEST_DELAY   = 2.0   # seconds between requests
 
 logging.basicConfig(
@@ -128,43 +127,37 @@ def map_comment(item: dict) -> dict:
 
 def fetch_thread(subreddit: str, post_id: str, session: requests.Session) -> tuple[dict | None, dict]:
     """
-    Returns (post_data, comments_by_id) for a Reddit thread.
-    Uses public old.reddit.com JSON — no auth required.
+    Returns (post_data, comments_by_id) using Arctic Shift APIs.
+    - Post data: /api/posts/ids
+    - Comments: /api/comments/tree
     """
-    url = f"{REDDIT_BASE}/r/{subreddit}/comments/{post_id}.json"
-    try:
-        resp = session.get(url, params={"limit": 500, "depth": 10}, timeout=15)
-        resp.raise_for_status()
-        payload = resp.json()
-    except Exception as e:
-        log.warning("Failed to fetch thread %s: %s", post_id, e)
-        return None, {}
-
     post_data: dict | None = None
     comments_by_id: dict[str, dict] = {}
 
+    # Fetch post metadata
     try:
-        post_data = payload[0]["data"]["children"][0]["data"]
-    except (IndexError, KeyError):
-        pass
+        resp = session.get(f"{ARCTIC_BASE}/api/posts/ids", params={"ids": post_id}, timeout=15)
+        resp.raise_for_status()
+        posts = resp.json().get("data", [])
+        if posts:
+            post_data = posts[0]
+    except Exception as e:
+        log.warning("Arctic Shift: failed to fetch post %s: %s", post_id, e)
 
-    def walk(node):
-        if not isinstance(node, dict):
-            return
-        kind = node.get("kind")
-        data = node.get("data", {})
-        if kind == "t1" and data.get("id"):
-            comments_by_id[data["id"]] = data
-        replies = data.get("replies")
-        if isinstance(replies, dict):
-            for child in replies.get("data", {}).get("children", []):
-                walk(child)
-
+    # Fetch comment tree
     try:
-        for child in payload[1]["data"]["children"]:
-            walk(child)
-    except (IndexError, KeyError):
-        pass
+        resp = session.get(
+            f"{ARCTIC_BASE}/api/comments/tree",
+            params={"link_id": f"t3_{post_id}", "limit": 9999},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        items = resp.json().get("data", [])
+        for item in items:
+            if isinstance(item, dict) and item.get("id") and item.get("kind") != "more":
+                comments_by_id[item["id"]] = item
+    except Exception as e:
+        log.warning("Arctic Shift: failed to fetch tree %s: %s", post_id, e)
 
     return post_data, comments_by_id
 
@@ -291,13 +284,16 @@ def run(full: bool):
     known_post_ctx_ids    = get_existing_ids(supabase, "reddit_post_context")
     known_comment_ctx_ids = get_existing_ids(supabase, "reddit_comment_context")
 
-    # For context: use new comments + any stored comments missing post context
-    if not full:
-        stored = supabase.table("reddit_comments").select("id,subreddit,link_id,parent_id").execute().data or []
+    # Load all stored comments for context resolution
+    stored = supabase.table("reddit_comments").select("id,subreddit,link_id,parent_id").execute().data or []
+
+    if full:
+        # Re-fetch context for every comment in the database
+        all_for_ctx = stored
+    else:
+        # Only fetch context for comments whose post context is missing
         all_for_ctx = [c for c in stored if c.get("link_id", "").removeprefix("t3_") not in known_post_ctx_ids]
         all_for_ctx += new_comments
-    else:
-        all_for_ctx = new_comments
 
     post_ctx_rows, comment_ctx_rows = fetch_all_context(
         all_for_ctx, known_post_ctx_ids, known_comment_ctx_ids, full, session
