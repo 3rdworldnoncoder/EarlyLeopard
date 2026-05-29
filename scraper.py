@@ -13,6 +13,7 @@ Usage:
 import argparse
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -210,7 +211,21 @@ def fetch_thread(subreddit: str, post_id: str, session: requests.Session) -> tup
     except Exception as e:
         log.warning("Arctic Shift: failed to fetch post %s: %s", post_id, e)
 
-    # Fetch comment tree
+    # Fetch comment tree — Arctic Shift returns a nested structure with replies
+    def walk_tree(nodes: list):
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            if node.get("kind") == "more":
+                continue
+            cid = node.get("id")
+            if cid:
+                comments_by_id[cid] = node
+            # Recurse into replies (can be a list or absent)
+            replies = node.get("replies") or []
+            if isinstance(replies, list):
+                walk_tree(replies)
+
     try:
         resp = session.get(
             f"{ARCTIC_BASE}/api/comments/tree",
@@ -219,9 +234,8 @@ def fetch_thread(subreddit: str, post_id: str, session: requests.Session) -> tup
         )
         resp.raise_for_status()
         items = resp.json().get("data", [])
-        for item in items:
-            if isinstance(item, dict) and item.get("id") and item.get("kind") != "more":
-                comments_by_id[item["id"]] = item
+        walk_tree(items)
+        log.debug("  tree: %d comments indexed for post %s", len(comments_by_id), post_id)
     except Exception as e:
         log.warning("Arctic Shift: failed to fetch tree %s: %s", post_id, e)
 
@@ -261,6 +275,19 @@ def fetch_all_context(
         post_data, comments_by_id = fetch_thread(subreddit, post_id, session)
 
         if post_data:
+            # Extract media info
+            media_url, media_type = None, None
+            reddit_video = (post_data.get("media") or {}).get("reddit_video")
+            if reddit_video:
+                media_url  = reddit_video.get("fallback_url")
+                media_type = "video"
+            elif post_data.get("url") and re.search(
+                r'(i\.redd\.it|i\.imgur\.com|\.(jpg|jpeg|png|gif|webp))(\?|$)',
+                post_data["url"], re.I
+            ):
+                media_url  = post_data["url"]
+                media_type = "image"
+
             post_ctx_rows.append({
                 "id":          post_data.get("id", post_id),
                 "title":       post_data.get("title"),
@@ -269,6 +296,8 @@ def fetch_all_context(
                 "subreddit":   post_data.get("subreddit"),
                 "permalink":   post_data.get("permalink"),
                 "created_utc": int(post_data["created_utc"]) if post_data.get("created_utc") is not None else None,
+                "media_url":   media_url,
+                "media_type":  media_type,
                 "captured_at": now,
             })
 

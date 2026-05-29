@@ -74,3 +74,7 @@ create table if not exists reddit_comment_context (
 );
 
 create index if not exists reddit_comment_context_post_id_idx on reddit_comment_context (post_id);
+
+-- Migration: add media fields to reddit_post_context
+alter table reddit_post_context add column if not exists media_url  text;
+alter table reddit_post_context add column if not exists media_type text; -- 'video' | 'image' | null
