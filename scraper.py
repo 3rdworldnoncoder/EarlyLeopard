@@ -205,25 +205,33 @@ def fetch_all_context(
                 "captured_at": now,
             })
 
+        # Walk full ancestor chain for each EL comment
+        seen_in_thread: set[str] = set()
         for el_c in el_comments:
-            parent_id_full = el_c.get("parent_id", "")
-            if not parent_id_full.startswith("t1_"):
-                continue
-            parent_comment_id = parent_id_full.removeprefix("t1_")
-            if not full and parent_comment_id in known_ctx_comment_ids:
-                continue
-            parent = comments_by_id.get(parent_comment_id)
-            if not parent:
-                continue
-            comment_ctx_rows.append({
-                "id":          parent_comment_id,
-                "author":      parent.get("author"),
-                "body":        parent.get("body"),
-                "created_utc": int(parent["created_utc"]) if parent.get("created_utc") is not None else None,
-                "post_id":     post_id,
-                "permalink":   parent.get("permalink"),
-                "captured_at": now,
-            })
+            current_parent = el_c.get("parent_id", "")
+            while current_parent.startswith("t1_"):
+                ancestor_id = current_parent.removeprefix("t1_")
+                if ancestor_id in seen_in_thread:
+                    break
+                seen_in_thread.add(ancestor_id)
+                if not full and ancestor_id in known_ctx_comment_ids:
+                    # Already stored — but still need to follow chain upward
+                    ancestor = comments_by_id.get(ancestor_id)
+                    current_parent = ancestor.get("parent_id", "") if ancestor else ""
+                    continue
+                ancestor = comments_by_id.get(ancestor_id)
+                if not ancestor:
+                    break
+                comment_ctx_rows.append({
+                    "id":          ancestor_id,
+                    "author":      ancestor.get("author"),
+                    "body":        ancestor.get("body"),
+                    "created_utc": int(ancestor["created_utc"]) if ancestor.get("created_utc") is not None else None,
+                    "post_id":     post_id,
+                    "permalink":   ancestor.get("permalink"),
+                    "captured_at": now,
+                })
+                current_parent = ancestor.get("parent_id", "")
 
         time.sleep(REQUEST_DELAY)
 
