@@ -21,6 +21,22 @@ on:
         options:
           - "false"
           - "true"
+      aat_only:
+        description: "Run AAT subreddit scraping only?"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      skip_aat:
+        description: "Skip AAT scraping (EL only)?"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
 
 jobs:
   scrape:
@@ -40,18 +56,31 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run scraper (incremental)
-        if: ${{ github.event.inputs.full != 'true' && github.event.inputs.audio_backfill != 'true' }}
+        if: ${{ github.event.inputs.full != 'true' && github.event.inputs.audio_backfill != 'true' && github.event.inputs.aat_only != 'true' }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        run: python scraper.py
+        run: |
+          ARGS=""
+          if [ "${{ github.event.inputs.skip_aat }}" = "true" ]; then ARGS="$ARGS --skip-aat"; fi
+          python scraper.py $ARGS
 
       - name: Run scraper (full backfill)
         if: ${{ github.event.inputs.full == 'true' }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        run: python scraper.py --full
+        run: |
+          ARGS="--full"
+          if [ "${{ github.event.inputs.skip_aat }}" = "true" ]; then ARGS="$ARGS --skip-aat"; fi
+          python scraper.py $ARGS
+
+      - name: Run AAT only
+        if: ${{ github.event.inputs.aat_only == 'true' }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python scraper.py --aat-only
 
       - name: Backfill audio for existing video posts
         if: ${{ github.event.inputs.audio_backfill == 'true' || github.event_name == 'schedule' }}

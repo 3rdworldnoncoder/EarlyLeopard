@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 """
-Early-Leopard-8351 Reddit scraper
-- Comments: Arctic Shift API (full history, no auth needed)
-- Thread context: Reddit public JSON (no cookies needed)
+Early-Leopard-8351 Reddit scraper + AAT (Aaron Alogs Tracker)
+- EL comments/posts: Arctic Shift API (full history, no auth needed)
+- AAT: top posters in r/Steeltoebeggingshow and r/steeltoe
 - Upserts to Supabase
 
 Usage:
-    python scraper.py          # incremental (only new comments)
-    python scraper.py --full   # full backfill (all history)
+    python scraper.py                 # incremental (EL + AAT)
+    python scraper.py --full          # full backfill (EL + AAT)
+    python scraper.py --skip-aat      # EL only
+    python scraper.py --aat-only      # AAT only
 """
 
 import argparse
 import logging
 import os
 import re
+import signal
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import requests
@@ -30,12 +33,17 @@ from supabase.lib.client_options import SyncClientOptions
 
 load_dotenv()
 
-SUPABASE_URL   = os.environ["SUPABASE_URL"]
-SUPABASE_KEY   = os.environ["SUPABASE_KEY"]
+SUPABASE_URL    = os.environ["SUPABASE_URL"]
+SUPABASE_KEY    = os.environ["SUPABASE_KEY"]
 REDDIT_USERNAME = "Early-Leopard-8351"
 USER_AGENT      = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 ARCTIC_BASE     = "https://arctic-shift.photon-reddit.com"
 REQUEST_DELAY   = 2.0   # seconds between requests
+
+# AAT config
+AAT_SUBREDDITS      = ["Steeltoebeggingshow", "steeltoe"]
+AAT_MIN_WORD_COUNT  = 3   # minimum words per comment to store
+AAT_SKIP_AUTHORS    = {"[deleted]", "AutoModerator", "BotDefense", "reddit"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,31 +53,48 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Arctic Shift — comments
+# Arctic Shift — generic paginated comment/post iterators
 # ---------------------------------------------------------------------------
 
 ARCTIC_COMMENT_FIELDS = "id,author,body,created_utc,subreddit,score,parent_id,link_id"
 ARCTIC_POST_FIELDS    = "id,author,title,selftext,url,created_utc,subreddit,score,num_comments"
 
 
-def iter_arctic_comments(known_ids: set, full: bool, session: requests.Session):
+def iter_arctic_comments(
+    known_ids: set,
+    full: bool,
+    session: requests.Session,
+    filter_params: dict | None = None,
+    after_utc: int | None = None,
+):
     """
     Yields raw comment dicts from Arctic Shift, paginating via created_utc asc.
+
+    filter_params: extra query params passed to Arctic Shift, e.g.
+        {"author": "Early-Leopard-8351"}   — EL mode (default)
+        {"subreddit": "steeltoe"}          — AAT mode
+
+    after_utc: unix timestamp to start from (inclusive). Used to limit
+        historical backfill to a recent window (e.g. last 6 months).
+
     In incremental mode, stops as soon as a full page is entirely known.
     """
-    after = None
+    if filter_params is None:
+        filter_params = {"author": REDDIT_USERNAME}
+
+    after = str(after_utc) if after_utc is not None else None
 
     while True:
         params = {
-            "author": REDDIT_USERNAME,
             "limit":  100,
             "sort":   "asc",
             "fields": ARCTIC_COMMENT_FIELDS,
+            **filter_params,
         }
         if after:
             params["after"] = after
 
-        log.info("Arctic Shift: fetching comments (after=%s)", after or "start")
+        log.info("Arctic Shift: fetching comments %s (after=%s)", filter_params, after or "start")
         try:
             resp = session.get(f"{ARCTIC_BASE}/api/comments/search", params=params, timeout=30)
             resp.raise_for_status()
@@ -90,7 +115,6 @@ def iter_arctic_comments(known_ids: set, full: bool, session: requests.Session):
 
         log.info("  got %d items, %d new.", len(data), new_count)
 
-        # In incremental mode: stop if entire page was already known
         if not full and new_count == 0:
             log.info("Arctic Shift: all items on page already known — stopping.")
             break
@@ -99,46 +123,33 @@ def iter_arctic_comments(known_ids: set, full: bool, session: requests.Session):
             log.info("Arctic Shift: reached end of history.")
             break
 
-        # Advance cursor: use last item's created_utc + 1s
         after = str(int(data[-1].get("created_utc", 0)) + 1)
         time.sleep(REQUEST_DELAY)
 
 
-def map_comment(item: dict) -> dict:
-    # Reconstruct permalink from parts (Arctic Shift doesn't return it)
-    link_id   = item.get("link_id", "").removeprefix("t3_")
-    subreddit = item.get("subreddit", "")
-    cid       = item.get("id", "")
-    permalink = f"/r/{subreddit}/comments/{link_id}/_/{cid}/" if link_id else None
-
-    return {
-        "id":          cid,
-        "author":      item.get("author"),
-        "body":        item.get("body"),
-        "created_utc": int(item["created_utc"]) if item.get("created_utc") is not None else None,
-        "subreddit":   subreddit,
-        "permalink":   permalink,
-        "score":       item.get("score"),
-        "parent_id":   item.get("parent_id"),
-        "link_id":     item.get("link_id"),
-        "captured_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-def iter_arctic_posts(known_ids: set, full: bool, session: requests.Session):
+def iter_arctic_posts(
+    known_ids: set,
+    full: bool,
+    session: requests.Session,
+    filter_params: dict | None = None,
+    after_utc: int | None = None,
+):
     """Yields raw post dicts from Arctic Shift."""
-    after = None
+    if filter_params is None:
+        filter_params = {"author": REDDIT_USERNAME}
+
+    after = str(after_utc) if after_utc is not None else None
     while True:
         params = {
-            "author": REDDIT_USERNAME,
             "limit":  100,
             "sort":   "asc",
             "fields": ARCTIC_POST_FIELDS,
+            **filter_params,
         }
         if after:
             params["after"] = after
 
-        log.info("Arctic Shift: fetching posts (after=%s)", after or "start")
+        log.info("Arctic Shift: fetching posts %s (after=%s)", filter_params, after or "start")
         try:
             resp = session.get(f"{ARCTIC_BASE}/api/posts/search", params=params, timeout=30)
             resp.raise_for_status()
@@ -171,6 +182,26 @@ def iter_arctic_posts(known_ids: set, full: bool, session: requests.Session):
         time.sleep(REQUEST_DELAY)
 
 
+def map_comment(item: dict) -> dict:
+    link_id   = item.get("link_id", "").removeprefix("t3_")
+    subreddit = item.get("subreddit", "")
+    cid       = item.get("id", "")
+    permalink = f"/r/{subreddit}/comments/{link_id}/_/{cid}/" if link_id else None
+
+    return {
+        "id":          cid,
+        "author":      item.get("author"),
+        "body":        item.get("body"),
+        "created_utc": int(item["created_utc"]) if item.get("created_utc") is not None else None,
+        "subreddit":   subreddit,
+        "permalink":   permalink,
+        "score":       item.get("score"),
+        "parent_id":   item.get("parent_id"),
+        "link_id":     item.get("link_id"),
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def map_post(item: dict) -> dict:
     pid       = item.get("id", "")
     subreddit = item.get("subreddit", "")
@@ -190,6 +221,54 @@ def map_post(item: dict) -> dict:
     }
 
 
+def map_aat_comment(item: dict) -> dict:
+    """Maps a raw Arctic Shift comment to the aat_author_comments schema."""
+    body       = item.get("body", "") or ""
+    word_count = len(body.split())
+    cid        = item.get("id", "")
+    subreddit  = item.get("subreddit", "")
+    link_id    = item.get("link_id", "").removeprefix("t3_")
+    permalink  = f"/r/{subreddit}/comments/{link_id}/_/{cid}/" if link_id else None
+
+    return {
+        "id":          cid,
+        "author":      item.get("author"),
+        "subreddit":   subreddit,
+        "type":        "comment",
+        "body":        body,
+        "word_count":  word_count,
+        "score":       item.get("score"),
+        "permalink":   permalink,
+        "created_utc": int(item["created_utc"]) if item.get("created_utc") is not None else None,
+        "inserted_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def map_aat_post(item: dict) -> dict:
+    """Maps a raw Arctic Shift post to the aat_author_comments schema (type='post')."""
+    pid       = item.get("id", "")
+    subreddit = item.get("subreddit", "")
+    title     = item.get("title", "") or ""
+    selftext  = item.get("selftext", "") or ""
+    # Combine title + selftext as the text body; title alone is still useful
+    body      = f"{title}\n\n{selftext}".strip() if selftext else title
+    word_count = len(body.split())
+    permalink  = f"/r/{subreddit}/comments/{pid}/" if pid else None
+
+    return {
+        "id":          pid,
+        "author":      item.get("author"),
+        "subreddit":   subreddit,
+        "type":        "post",
+        "body":        body,
+        "word_count":  word_count,
+        "score":       item.get("score"),
+        "permalink":   permalink,
+        "created_utc": int(item["created_utc"]) if item.get("created_utc") is not None else None,
+        "inserted_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Reddit JSON — thread context (no cookies needed)
 # ---------------------------------------------------------------------------
@@ -203,7 +282,6 @@ def fetch_thread(subreddit: str, post_id: str, session: requests.Session) -> tup
     post_data: dict | None = None
     comments_by_id: dict[str, dict] = {}
 
-    # Fetch post metadata
     try:
         resp = session.get(f"{ARCTIC_BASE}/api/posts/ids", params={"ids": post_id}, timeout=15)
         resp.raise_for_status()
@@ -213,12 +291,10 @@ def fetch_thread(subreddit: str, post_id: str, session: requests.Session) -> tup
     except Exception as e:
         log.warning("Arctic Shift: failed to fetch post %s: %s", post_id, e)
 
-    # Fetch comment tree — Arctic Shift returns a nested structure with replies
     def walk_tree(nodes: list):
         for node in nodes:
             if not isinstance(node, dict):
                 continue
-            # Arctic Shift returns Reddit-style wrapper nodes with kind/data
             if node.get("kind") == "more":
                 continue
             if "data" in node and isinstance(node["data"], dict):
@@ -267,12 +343,11 @@ def fetch_all_context(
         if post_id:
             post_map.setdefault(post_id, []).append(c)
 
-    # Always skip already-archived posts unless reindex_context is set
     posts_to_fetch = set(post_map.keys()) if full == 'reindex' else {p for p in post_map if p not in known_post_ids}
     log.info("Fetching context for %d unique posts...", len(posts_to_fetch))
 
-    post_ctx_rows:     list[dict] = []
-    comment_ctx_rows:  list[dict] = []
+    post_ctx_rows:    list[dict] = []
+    comment_ctx_rows: list[dict] = []
     now = datetime.now(timezone.utc).isoformat()
 
     for post_id in posts_to_fetch:
@@ -283,14 +358,11 @@ def fetch_all_context(
         post_data, comments_by_id = fetch_thread(subreddit, post_id, session)
 
         if post_data:
-            # Extract media info
             media_url, media_type, audio_url = None, None, None
             reddit_video = (post_data.get("media") or {}).get("reddit_video")
             if reddit_video:
                 media_url  = reddit_video.get("fallback_url")
                 media_type = "video"
-                # Download audio and store in Supabase Storage so the browser
-                # can play it without hitting v.redd.it CORS restrictions.
                 audio_url = fetch_and_store_audio(supabase, post_data.get("id", post_id), media_url, session)
             elif post_data.get("url") and re.search(
                 r'(i\.redd\.it|i\.imgur\.com|\.(jpg|jpeg|png|gif|webp))(\?|$)',
@@ -313,7 +385,6 @@ def fetch_all_context(
                 "captured_at": now,
             })
 
-        # Walk full ancestor chain for each EL comment
         seen_in_thread: set[str] = set()
         for el_c in el_comments:
             current_parent = el_c.get("parent_id", "")
@@ -323,7 +394,6 @@ def fetch_all_context(
                     break
                 seen_in_thread.add(ancestor_id)
                 if not full and ancestor_id in known_ctx_comment_ids and ancestor_id not in refresh_ctx_comment_ids:
-                    # Already stored — but still need to follow chain upward
                     ancestor = comments_by_id.get(ancestor_id)
                     current_parent = ancestor.get("parent_id", "") if ancestor else ""
                     continue
@@ -400,7 +470,7 @@ def fetch_and_store_audio(supabase: Client, post_id: str, video_url: str | None,
     try:
         r = session.get(audio_src, timeout=30)
         if r.status_code == 403 or len(r.content) < 1000:
-            return ""   # no audio track — sentinel so we don't retry
+            return ""
         r.raise_for_status()
         path = f"{post_id}.mp4"
         supabase.storage.from_(AUDIO_BUCKET).upload(
@@ -424,95 +494,217 @@ def upsert_in_chunks(supabase: Client, table: str, rows: list[dict], chunk: int 
 
 
 # ---------------------------------------------------------------------------
-# Main
+# AAT — subreddit scraper
 # ---------------------------------------------------------------------------
 
-def run(full: bool, reindex_context: bool = False):
+# ---------------------------------------------------------------------------
+# Graceful shutdown — CTRL+C flushes buffered rows before exit
+# ---------------------------------------------------------------------------
+
+class _GracefulExit(Exception):
+    pass
+
+def _install_sigint_handler():
+    """Replace the default SIGINT handler with one that raises _GracefulExit."""
+    def handler(sig, frame):
+        log.warning("SIGINT received — flushing buffered data before exit…")
+        raise _GracefulExit()
+    signal.signal(signal.SIGINT, handler)
+
+
+def _aat_skip(author: str, body: str) -> bool:
+    """Returns True if this item should be excluded from AAT."""
+    if not author or author in AAT_SKIP_AUTHORS:
+        return True
+    if author.startswith("bot_") or author.lower().endswith("bot"):
+        return True
+    if body in ("[deleted]", "[removed]", ""):
+        return True
+    if len(body.split()) < AAT_MIN_WORD_COUNT:
+        return True
+    return False
+
+
+def run_aat(supabase: Client, session: requests.Session, full: bool):
+    """
+    Scrapes comments AND posts from AAT_SUBREDDITS and upserts to aat_author_comments.
+    Skips bots, deleted accounts, and very short items.
+    type='comment' for comments, type='post' for OPs.
+    """
+    # For full backfill, limit to last 6 months to avoid scraping the entire
+    # subreddit history. Incremental runs don't need this — they stop naturally.
+    AAT_LOOKBACK_DAYS = 180
+    after_utc = (
+        int((datetime.now(timezone.utc) - timedelta(days=AAT_LOOKBACK_DAYS)).timestamp())
+        if full else None
+    )
+
+    log.info(
+        "=== AAT scraper — %s%s ===",
+        "FULL" if full else "INCREMENTAL",
+        f" (since {AAT_LOOKBACK_DAYS}d ago)" if after_utc else "",
+    )
+
+    known_aat_ids = get_existing_ids(supabase, "aat_author_comments")
+    new_rows: list[dict] = []
+
+    try:
+        for sub in AAT_SUBREDDITS:
+            log.info("--- r/%s: comments ---", sub)
+            for item in iter_arctic_comments(
+                known_ids=known_aat_ids,
+                full=full,
+                session=session,
+                filter_params={"subreddit": sub},
+                after_utc=after_utc,
+            ):
+                author = item.get("author", "") or ""
+                body   = item.get("body", "") or ""
+                if _aat_skip(author, body):
+                    continue
+                row = map_aat_comment(item)
+                new_rows.append(row)
+                known_aat_ids.add(item["id"])
+
+            time.sleep(REQUEST_DELAY)
+
+            log.info("--- r/%s: posts ---", sub)
+            for item in iter_arctic_posts(
+                known_ids=known_aat_ids,
+                full=full,
+                session=session,
+                filter_params={"subreddit": sub},
+                after_utc=after_utc,
+            ):
+                author = item.get("author", "") or ""
+                title  = item.get("title", "") or ""
+                if _aat_skip(author, title):
+                    continue
+                row = map_aat_post(item)
+                new_rows.append(row)
+                known_aat_ids.add(item["id"])
+
+            time.sleep(REQUEST_DELAY)
+
+    except _GracefulExit:
+        log.warning("Interrupted. Flushing %d buffered rows…", len(new_rows))
+
+    n = upsert_in_chunks(supabase, "aat_author_comments", new_rows)
+    log.info("AAT items upserted: %d", n)
+
+
+# ---------------------------------------------------------------------------
+# Main — Early Leopard
+# ---------------------------------------------------------------------------
+
+def run(full: bool, reindex_context: bool = False, skip_aat: bool = False, aat_only: bool = False):
+    _install_sigint_handler()
+
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     session  = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
 
-    # mode string for logging
-    if reindex_context:
-        mode = "REINDEX CONTEXT"
-    elif full:
-        mode = "FULL BACKFILL"
-    else:
-        mode = "INCREMENTAL"
-    log.info("=== Early Leopard scraper — %s ===", mode)
+    if not aat_only:
+        # mode string for logging
+        if reindex_context:
+            mode = "REINDEX CONTEXT"
+        elif full:
+            mode = "FULL BACKFILL"
+        else:
+            mode = "INCREMENTAL"
+        log.info("=== Early Leopard scraper — %s ===", mode)
 
-    # ---- Comments (Arctic Shift) ----
-    known_comment_ids = get_existing_ids(supabase, "reddit_comments")
-    new_comments: list[dict] = []
+        # ---- Comments (Arctic Shift) ----
+        known_comment_ids = get_existing_ids(supabase, "reddit_comments")
+        new_comments: list[dict] = []
 
-    if not reindex_context:
-        for item in iter_arctic_comments(known_comment_ids, full, session):
-            new_comments.append(item)
+        if not reindex_context:
+            try:
+                for item in iter_arctic_comments(known_comment_ids, full, session):
+                    new_comments.append(item)
+            except _GracefulExit:
+                log.warning("Interrupted during EL comments. Flushing %d rows…", len(new_comments))
+                upsert_in_chunks(supabase, "reddit_comments", [map_comment(c) for c in new_comments])
+                sys.exit(0)
 
-    n = upsert_in_chunks(supabase, "reddit_comments", [map_comment(c) for c in new_comments])
-    log.info("Comments upserted: %d", n)
+        n = upsert_in_chunks(supabase, "reddit_comments", [map_comment(c) for c in new_comments])
+        log.info("Comments upserted: %d", n)
 
-    # ---- Thread context (Reddit JSON) ----
-    known_post_ctx_ids    = get_existing_ids(supabase, "reddit_post_context")
-    known_comment_ctx_ids = get_existing_ids(supabase, "reddit_comment_context")
-    null_parent_ctx_ids, null_parent_post_ids = get_null_parent_context_comment_ids(supabase)
+        # ---- Thread context (Reddit JSON) ----
+        known_post_ctx_ids    = get_existing_ids(supabase, "reddit_post_context")
+        known_comment_ctx_ids = get_existing_ids(supabase, "reddit_comment_context")
+        null_parent_ctx_ids, null_parent_post_ids = get_null_parent_context_comment_ids(supabase)
 
-    # Load all stored comments for context resolution
-    stored = supabase.table("reddit_comments").select("id,subreddit,link_id,parent_id").execute().data or []
+        stored = supabase.table("reddit_comments").select("id,subreddit,link_id,parent_id").execute().data or []
 
-    # --reindex-context: force re-fetch all contexts; otherwise skip already-known posts
-    ctx_mode = 'reindex' if reindex_context else False
-    if reindex_context:
-        all_for_ctx = stored
-    else:
-        posts_to_refresh = {
-            c.get("link_id", "").removeprefix("t3_")
-            for c in stored
-            if c.get("link_id", "").removeprefix("t3_") not in known_post_ctx_ids
-            or c.get("link_id", "").removeprefix("t3_") in null_parent_post_ids
-        }
-        comment_ids_seen = set()
-        all_for_ctx = []
-        for c in stored + new_comments:
-            cid = c.get("id")
-            if not cid or cid in comment_ids_seen:
-                continue
-            post_id = c.get("link_id", "").removeprefix("t3_")
-            if post_id and post_id in posts_to_refresh:
-                all_for_ctx.append(c)
-                comment_ids_seen.add(cid)
-        all_for_ctx.extend([c for c in new_comments if c.get("id") not in comment_ids_seen])
+        ctx_mode = 'reindex' if reindex_context else False
+        if reindex_context:
+            all_for_ctx = stored
+        else:
+            posts_to_refresh = {
+                c.get("link_id", "").removeprefix("t3_")
+                for c in stored
+                if c.get("link_id", "").removeprefix("t3_") not in known_post_ctx_ids
+                or c.get("link_id", "").removeprefix("t3_") in null_parent_post_ids
+            }
+            comment_ids_seen = set()
+            all_for_ctx = []
+            for c in stored + new_comments:
+                cid = c.get("id")
+                if not cid or cid in comment_ids_seen:
+                    continue
+                post_id = c.get("link_id", "").removeprefix("t3_")
+                if post_id and post_id in posts_to_refresh:
+                    all_for_ctx.append(c)
+                    comment_ids_seen.add(cid)
+            all_for_ctx.extend([c for c in new_comments if c.get("id") not in comment_ids_seen])
 
-    post_ctx_rows, comment_ctx_rows = fetch_all_context(
-        all_for_ctx,
-        known_post_ctx_ids,
-        known_comment_ctx_ids,
-        ctx_mode,
-        session,
-        refresh_ctx_comment_ids=null_parent_ctx_ids,
-    )
+        post_ctx_rows, comment_ctx_rows = fetch_all_context(
+            all_for_ctx,
+            known_post_ctx_ids,
+            known_comment_ctx_ids,
+            ctx_mode,
+            session,
+            refresh_ctx_comment_ids=null_parent_ctx_ids,
+        )
 
-    n_posts = upsert_in_chunks(supabase, "reddit_post_context",    post_ctx_rows)
-    n_ctxc  = upsert_in_chunks(supabase, "reddit_comment_context", comment_ctx_rows)
-    log.info("Post context upserted: %d", n_posts)
-    log.info("Comment context upserted: %d", n_ctxc)
+        n_posts = upsert_in_chunks(supabase, "reddit_post_context",    post_ctx_rows)
+        n_ctxc  = upsert_in_chunks(supabase, "reddit_comment_context", comment_ctx_rows)
+        log.info("Post context upserted: %d", n_posts)
+        log.info("Comment context upserted: %d", n_ctxc)
 
-    # ---- Posts (submitted) ----
-    known_post_ids = get_existing_ids(supabase, "reddit_posts")
-    new_posts: list[dict] = []
+        # ---- Posts (submitted) ----
+        known_post_ids = get_existing_ids(supabase, "reddit_posts")
+        new_posts: list[dict] = []
 
-    for item in iter_arctic_posts(known_post_ids, full, session):
-        new_posts.append(item)
+        try:
+            for item in iter_arctic_posts(known_post_ids, full, session):
+                new_posts.append(item)
+        except _GracefulExit:
+            log.warning("Interrupted during EL posts. Flushing %d rows…", len(new_posts))
+            upsert_in_chunks(supabase, "reddit_posts", [map_post(p) for p in new_posts])
+            sys.exit(0)
 
-    n = upsert_in_chunks(supabase, "reddit_posts", [map_post(p) for p in new_posts])
-    log.info("Posts upserted: %d", n)
+        n = upsert_in_chunks(supabase, "reddit_posts", [map_post(p) for p in new_posts])
+        log.info("Posts upserted: %d", n)
+
+    # ---- AAT ----
+    if not skip_aat:
+        run_aat(supabase, session, full)
 
     log.info("=== Done. ===")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Early Leopard Reddit scraper")
-    parser.add_argument("--full",             action="store_true", help="Full backfill (all comments, missing context only)")
-    parser.add_argument("--reindex-context",  action="store_true", help="Re-fetch ALL thread context regardless of what's stored")
+    parser = argparse.ArgumentParser(description="Early Leopard + AAT Reddit scraper")
+    parser.add_argument("--full",            action="store_true", help="Full backfill (all comments, missing context only)")
+    parser.add_argument("--reindex-context", action="store_true", help="Re-fetch ALL thread context regardless of what's stored")
+    parser.add_argument("--skip-aat",        action="store_true", help="Skip AAT subreddit scraping (EL only)")
+    parser.add_argument("--aat-only",        action="store_true", help="Run AAT scraping only, skip EL")
     args = parser.parse_args()
-    run(full=args.full, reindex_context=args.reindex_context)
+    run(
+        full=args.full,
+        reindex_context=args.reindex_context,
+        skip_aat=args.skip_aat,
+        aat_only=args.aat_only,
+    )
