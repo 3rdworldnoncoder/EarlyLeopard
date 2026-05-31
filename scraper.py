@@ -525,25 +525,47 @@ def _aat_skip(author: str, body: str) -> bool:
     return False
 
 
+def get_aat_cursor(supabase: Client) -> int | None:
+    """
+    Returns the max created_utc stored in aat_author_comments, or None if empty.
+    Used as the starting cursor for incremental runs so we don't re-scan history.
+    """
+    try:
+        resp = (
+            supabase.table("aat_author_comments")
+            .select("created_utc")
+            .order("created_utc", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = resp.data or []
+        if rows and rows[0].get("created_utc"):
+            ts = int(rows[0]["created_utc"])
+            log.info("AAT incremental cursor: %d (%s)", ts, datetime.fromtimestamp(ts, tz=timezone.utc).isoformat())
+            return ts
+    except Exception as e:
+        log.warning("Could not fetch AAT cursor: %s", e)
+    return None
+
+
 def run_aat(supabase: Client, session: requests.Session, full: bool):
     """
     Scrapes comments AND posts from AAT_SUBREDDITS and upserts to aat_author_comments.
     Skips bots, deleted accounts, and very short items.
     type='comment' for comments, type='post' for OPs.
     """
-    # For full backfill, limit to last 6 months to avoid scraping the entire
-    # subreddit history. Incremental runs don't need this — they stop naturally.
     AAT_LOOKBACK_DAYS = 180
-    after_utc = (
-        int((datetime.now(timezone.utc) - timedelta(days=AAT_LOOKBACK_DAYS)).timestamp())
-        if full else None
-    )
 
-    log.info(
-        "=== AAT scraper — %s%s ===",
-        "FULL" if full else "INCREMENTAL",
-        f" (since {AAT_LOOKBACK_DAYS}d ago)" if after_utc else "",
-    )
+    if full:
+        # Full backfill: limit to last 180 days to avoid scraping entire history
+        after_utc = int((datetime.now(timezone.utc) - timedelta(days=AAT_LOOKBACK_DAYS)).timestamp())
+        label = f"FULL (since {AAT_LOOKBACK_DAYS}d ago)"
+    else:
+        # Incremental: start from the newest item already stored, not from time zero
+        after_utc = get_aat_cursor(supabase)
+        label = f"INCREMENTAL (since cursor)" if after_utc else "INCREMENTAL (no cursor — first run?)"
+
+    log.info("=== AAT scraper — %s ===", label)
 
     known_aat_ids = get_existing_ids(supabase, "aat_author_comments")
     new_rows: list[dict] = []
