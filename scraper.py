@@ -284,11 +284,14 @@ def fetch_all_context(
 
         if post_data:
             # Extract media info
-            media_url, media_type = None, None
+            media_url, media_type, audio_url = None, None, None
             reddit_video = (post_data.get("media") or {}).get("reddit_video")
             if reddit_video:
                 media_url  = reddit_video.get("fallback_url")
                 media_type = "video"
+                # Download audio and store in Supabase Storage so the browser
+                # can play it without hitting v.redd.it CORS restrictions.
+                audio_url = fetch_and_store_audio(supabase, post_data.get("id", post_id), media_url, session)
             elif post_data.get("url") and re.search(
                 r'(i\.redd\.it|i\.imgur\.com|\.(jpg|jpeg|png|gif|webp))(\?|$)',
                 post_data["url"], re.I
@@ -306,6 +309,7 @@ def fetch_all_context(
                 "created_utc": int(post_data["created_utc"]) if post_data.get("created_utc") is not None else None,
                 "media_url":   media_url,
                 "media_type":  media_type,
+                "audio_url":   audio_url,
                 "captured_at": now,
             })
 
@@ -374,6 +378,39 @@ def get_null_parent_context_comment_ids(supabase: Client) -> tuple[set[str], set
     post_ids = {r["post_id"] for r in rows if r.get("post_id")}
     log.info("  %d null-parent comment context rows found.", len(ids))
     return ids, post_ids
+
+
+AUDIO_BUCKET = "reddit-audio"
+
+def fetch_and_store_audio(supabase: Client, post_id: str, video_url: str | None, session: requests.Session) -> str | None:
+    """
+    Derives the Reddit audio URL, downloads it server-side (no CORS issue),
+    uploads to Supabase Storage, and returns the public URL.
+    Returns empty string if no audio track exists, None on error.
+    """
+    if not video_url or "v.redd.it" not in video_url:
+        return None
+    base = video_url.split("?")[0]
+    audio_src = re.sub(r"(?:DASH|CMAF)_\d+\.mp4$", "DASH_AUDIO_128.mp4", base, flags=re.IGNORECASE)
+    if audio_src == base:
+        m = re.search(r"v\.redd\.it/([^/?]+)", base)
+        if not m:
+            return None
+        audio_src = f"https://v.redd.it/{m.group(1)}/DASH_AUDIO_128.mp4"
+    try:
+        r = session.get(audio_src, timeout=30)
+        if r.status_code == 403 or len(r.content) < 1000:
+            return ""   # no audio track — sentinel so we don't retry
+        r.raise_for_status()
+        path = f"{post_id}.mp4"
+        supabase.storage.from_(AUDIO_BUCKET).upload(
+            path=path, file=r.content,
+            file_options={"content-type": "audio/mp4", "upsert": "true"},
+        )
+        return supabase.storage.from_(AUDIO_BUCKET).get_public_url(path)
+    except Exception as e:
+        log.warning("  Audio fetch/upload failed for %s: %s", post_id, e)
+        return None
 
 
 def upsert_in_chunks(supabase: Client, table: str, rows: list[dict], chunk: int = 100) -> int:

@@ -13,6 +13,14 @@ on:
         options:
           - "false"
           - "true"
+      audio_backfill:
+        description: "Run audio backfill only?"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
 
 jobs:
   scrape:
@@ -32,7 +40,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run scraper (incremental)
-        if: ${{ github.event.inputs.full != 'true' }}
+        if: ${{ github.event.inputs.full != 'true' && github.event.inputs.audio_backfill != 'true' }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
@@ -44,3 +52,10 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python scraper.py --full
+
+      - name: Backfill audio for existing video posts
+        if: ${{ github.event.inputs.audio_backfill == 'true' || github.event_name == 'schedule' }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python backfill_audio.py

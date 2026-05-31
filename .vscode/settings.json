@@ -1,0 +1,20 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^cd /d F:\\\\Python\\\\EarlyLeopard; python - <<'PY'\nimport requests, json\nBASE='https://arctic-shift\\.photon-reddit\\.com'\n# sample post from a recent comment or thread; use a known Reddit post id if available\n# if no sample, fetch EL comments and pick a link_id\ntry:\n    r = requests\\.get\\(BASE\\+'/api/comments/tree', params=\\{'link_id':'t3_13ijbxb','limit':10\\}, timeout=30\\)\n    print\\('status', r\\.status_code\\)\n    data = r\\.json\\(\\)\n    print\\('keys', data\\.keys\\(\\)\\)\n    print\\(json\\.dumps\\(data\\.get\\('data'\\)\\[:2\\], indent=2\\) if isinstance\\(data\\.get\\('data'\\), list\\) else json\\.dumps\\(data\\.get\\('data'\\), indent=2\\)\\)\nexcept Exception as e:\n    print\\('err', e\\)\nPY$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^python -c \"import requests, json; BASE='https://arctic-shift\\.photon-reddit\\.com'; r=requests\\.get\\(BASE\\+'/api/comments/tree', params=\\{'link_id':'t3_13ijbxb','limit':10\\}, timeout=30\\); print\\('status', r\\.status_code\\); data=r\\.json\\(\\); print\\('keys', list\\(data\\.keys\\(\\)\\)\\); d=data\\.get\\('data'\\); import pprint; pprint\\.pprint\\(d if isinstance\\(d, list\\) else d\\);\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^python -c \"import requests; print\\(requests\\.__version__\\); import requests, json; BASE='https://arctic-shift\\.photon-reddit\\.com'; r=requests\\.get\\(BASE\\+'/api/comments/tree', params=\\{'link_id':'t3_13ijbxb','limit':10\\}, timeout=30\\); print\\('status', r\\.status_code\\); print\\(r\\.text\\[:2000\\]\\);\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^python -c \"import requests, json; BASE='https://arctic-shift\\.photon-reddit\\.com'; r=requests\\.get\\(BASE\\+'/api/comments/search', params=\\{'author':'Early-Leopard-8351','limit':1,'fields':'id,parent_id,link_id,subreddit,created_utc,body', 'sort':'desc'\\}, timeout=30\\); print\\(r\\.status_code\\); data=r\\.json\\(\\); print\\(json\\.dumps\\(data, indent=2\\)\\);\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
