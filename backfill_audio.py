@@ -59,16 +59,15 @@ log = logging.getLogger(__name__)
 def derive_audio_url(video_url: str) -> str | None:
     """
     Derives the Reddit audio URL from the video fallback URL.
-    Handles both old DASH format (DASH_720.mp4) and new CMAF format (CMAF_1080.mp4).
+    DASH videos (DASH_720.mp4)  → DASH_AUDIO_128.mp4
+    CMAF videos (CMAF_1080.mp4) → CMAF_AUDIO_128.mp4  (preserve prefix!)
     """
     if not video_url or "v.redd.it" not in video_url:
         return None
-    # Strip query params
     base = video_url.split("?")[0]
-    # Replace DASH_XXX or CMAF_XXX → DASH_AUDIO_128
-    audio = re.sub(r"(?:DASH|CMAF)_\d+\.mp4$", "DASH_AUDIO_128.mp4", base, flags=re.IGNORECASE)
+    # Preserve format prefix: DASH→DASH_AUDIO_128, CMAF→CMAF_AUDIO_128
+    audio = re.sub(r"(DASH|CMAF)_\d+\.mp4$", lambda m: f"{m.group(1)}_AUDIO_128.mp4", base, flags=re.IGNORECASE)
     if audio == base:
-        # Pattern didn't match — construct from video ID
         m = re.search(r"v\.redd\.it/([^/?]+)", base)
         if not m:
             return None

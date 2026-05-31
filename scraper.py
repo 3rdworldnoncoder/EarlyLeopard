@@ -391,7 +391,7 @@ def fetch_and_store_audio(supabase: Client, post_id: str, video_url: str | None,
     if not video_url or "v.redd.it" not in video_url:
         return None
     base = video_url.split("?")[0]
-    audio_src = re.sub(r"(?:DASH|CMAF)_\d+\.mp4$", "DASH_AUDIO_128.mp4", base, flags=re.IGNORECASE)
+    audio_src = re.sub(r"(DASH|CMAF)_\d+\.mp4$", lambda m: f"{m.group(1)}_AUDIO_128.mp4", base, flags=re.IGNORECASE)
     if audio_src == base:
         m = re.search(r"v\.redd\.it/([^/?]+)", base)
         if not m:
