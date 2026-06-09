@@ -44,7 +44,7 @@ ARCTIC_BASE     = "https://arctic-shift.photon-reddit.com"
 REQUEST_DELAY   = 2.0   # seconds between requests
 
 # AAT config
-AAT_SUBREDDITS      = ["Steeltoebeggingshow", "steeltoe"]
+AAT_SUBREDDITS      = ["Steeltoebeggingshow", "steeltoe", "SteelToeBoringShow"]
 AAT_MIN_WORD_COUNT  = 3   # minimum words per comment to store
 AAT_SKIP_AUTHORS    = {"[deleted]", "AutoModerator", "BotDefense", "reddit"}
 
@@ -131,6 +131,21 @@ def _pctile(score: float, sorted_list: list[float]) -> int:
     if not sorted_list:
         return 50
     return round(sum(1 for s in sorted_list if s < score) / len(sorted_list) * 100)
+
+
+def _select_baseline(buckets: list | dict, n_chunks: int) -> list[float]:
+    """Select the impostor baseline bucket closest to n_chunks.
+    Accepts either a plain sorted list (legacy flat model) or a dict of
+    bucketed baselines {5: [...], 10: [...], 20: [...], 50: [...], 'full': [...]}.
+    """
+    if isinstance(buckets, list):
+        return buckets  # backward compat with flat model
+    # JSON deserialises all keys as strings; work with string keys throughout.
+    sizes = sorted(int(k) for k in buckets if k != 'full' and str(k).isdigit())
+    for size in sizes:
+        if n_chunks <= size:
+            return buckets[str(size)]
+    return buckets.get('full', [])
 
 
 def _word_length_profile(chunks: list[str]) -> list[float]:
@@ -253,28 +268,30 @@ def _score_precomputed(text: str, model: dict) -> dict | None:
     if not chunks:
         return None
 
+    n = len(chunks)
+
     # A1 — word length distribution (Mendenhall)
     a1s    = _cosine(_word_length_profile(chunks), model['a1Ref'])
-    a1_pct = _pctile(a1s, model['a1Impostors'])
+    a1_pct = _pctile(a1s, _select_baseline(model['a1Impostors'], n))
     a1_pass = a1_pct >= _AAT_PASS_PCT
 
     # A2 — function-word char n-grams (Overdorf & Greenstadt)
     a2s    = _cosine(_fw_profile(chunks, model['a2Vocab']), model['a2Ref'])
-    a2_pct = _pctile(a2s, model['a2Impostors'])
+    a2_pct = _pctile(a2s, _select_baseline(model['a2Impostors'], n))
     a2_pass = a2_pct >= _AAT_PASS_PCT
 
     # A3 — function-word presence rates (Koppel)
     a3s    = _a3_score(chunks, model['a3RefRates'])
-    a3_pct = _pctile(a3s, model['a3Impostors'])
+    a3_pct = _pctile(a3s, _select_baseline(model['a3Impostors'], n))
     a3_pass = a3_pct >= _AAT_PASS_PCT
 
     # A5 — Normalized Compression Distance (Cilibrasi & Vitanyi)
     a5s    = _ncd_similarity(model['a5Samples'], text)
-    a5_pct = _pctile(a5s, model['a5Impostors'])
+    a5_pct = _pctile(a5s, _select_baseline(model['a5Impostors'], n))
     a5_pass = a5_pct >= _AAT_PASS_PCT
 
     # A6 — Unmasking curve (Koppel 2007)
-    a6     = _unmasking_curve(chunks, model['a3RefRates'], model['a6Impostors'])
+    a6     = _unmasking_curve(chunks, model['a3RefRates'], _select_baseline(model['a6Impostors'], n))
     a6_pass = a6['robust']
     a6_auc  = a6['auc']
 
@@ -791,15 +808,20 @@ def get_aat_cursor(supabase: Client) -> int | None:
     return None
 
 
-def run_aat(supabase: Client, session: requests.Session, full: bool):
+def run_aat(supabase: Client, session: requests.Session, full: bool, since_utc: int | None = None):
     """
     Scrapes comments AND posts from AAT_SUBREDDITS and upserts to aat_author_comments.
     Skips bots, deleted accounts, and very short items.
     type='comment' for comments, type='post' for OPs.
+    since_utc: explicit UTC timestamp to start from (overrides full/incremental logic).
     """
     AAT_LOOKBACK_DAYS = 180
 
-    if full:
+    if since_utc is not None:
+        after_utc = since_utc
+        import datetime as _dt
+        label = f"SINCE {_dt.datetime.utcfromtimestamp(since_utc).strftime('%Y-%m-%d')}"
+    elif full:
         # Full backfill: limit to last 180 days to avoid scraping entire history
         after_utc = int((datetime.now(timezone.utc) - timedelta(days=AAT_LOOKBACK_DAYS)).timestamp())
         label = f"FULL (since {AAT_LOOKBACK_DAYS}d ago)"
@@ -866,11 +888,13 @@ def run_aat(supabase: Client, session: requests.Session, full: bool):
     log.info("AAT items upserted: %d", n)
 
 
-def run_aat_scoring(supabase: Client, model: dict):
+def run_aat_scoring(supabase: Client, model: dict, rescore_all: bool = False):
     """
     Compute A1/A2/A3/A5/A6 stylometric scores for all qualified authors and upsert
     to aat_author_scores.  Only re-scores authors who have new content since
     their last computed_at, skipping unchanged ones for efficiency.
+    Pass rescore_all=True to force rescore regardless of computed_at (e.g. after
+    regenerating the model with new baselines).
     A4 (POS bigrams via wink-nlp) remains client-side only.
     """
     log.info("=== AAT scoring — A1/A2/A3/A5/A6 pre-computation ===")
@@ -932,7 +956,7 @@ def run_aat_scoring(supabase: Client, model: dict):
         if meta['word_count'] < _AAT_MIN_WORDS:
             continue
         computed_at = existing.get(author, '')
-        if computed_at and meta['max_inserted_at'] <= computed_at:
+        if not rescore_all and computed_at and meta['max_inserted_at'] <= computed_at:
             skipped += 1
             continue   # no new content since last score
         to_score.append((author, meta['word_count']))
@@ -1029,7 +1053,7 @@ def run_aat_scoring(supabase: Client, model: dict):
 # Main — Early Leopard
 # ---------------------------------------------------------------------------
 
-def run(full: bool, reindex_context: bool = False, skip_aat: bool = False, aat_only: bool = False):
+def run(full: bool, reindex_context: bool = False, skip_aat: bool = False, aat_only: bool = False, rescore_all: bool = False, aat_since: int | None = None):
     _install_sigint_handler()
 
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -1123,8 +1147,8 @@ def run(full: bool, reindex_context: bool = False, skip_aat: bool = False, aat_o
 
     # ---- AAT ----
     if not skip_aat:
-        run_aat(supabase, session, full)
-        run_aat_scoring(supabase, aat_model)
+        run_aat(supabase, session, full, since_utc=aat_since)
+        run_aat_scoring(supabase, aat_model, rescore_all=rescore_all)
 
     log.info("=== Done. ===")
 
@@ -1135,10 +1159,18 @@ if __name__ == "__main__":
     parser.add_argument("--reindex-context", action="store_true", help="Re-fetch ALL thread context regardless of what's stored")
     parser.add_argument("--skip-aat",        action="store_true", help="Skip AAT subreddit scraping (EL only)")
     parser.add_argument("--aat-only",        action="store_true", help="Run AAT scraping only, skip EL")
+    parser.add_argument("--rescore-all",     action="store_true", help="Force rescore all authors regardless of computed_at (use after regenerating model)")
+    parser.add_argument("--aat-since",       type=str, default=None, help="Scrape AAT from this date onward (YYYY-MM-DD), overrides --full/incremental cursor")
     args = parser.parse_args()
+    aat_since_utc = None
+    if args.aat_since:
+        from datetime import datetime as _dt
+        aat_since_utc = int(_dt.strptime(args.aat_since, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
     run(
         full=args.full,
         reindex_context=args.reindex_context,
         skip_aat=args.skip_aat,
         aat_only=args.aat_only,
+        rescore_all=args.rescore_all,
+        aat_since=aat_since_utc,
     )
