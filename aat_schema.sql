@@ -28,9 +28,9 @@ CREATE POLICY "Public read" ON aat_author_comments
     FOR SELECT USING (true);
 
 -- ---------------------------------------------------------------------------
--- aat_author_scores: A1/A2/A3 pre-computed per author by the scraper.
--- Updated after each AAT run; client uses this for instant ranking without
--- client-side Phase 2 scoring.
+-- aat_author_scores: A1/A2/A3/A5/A6 pre-computed per author by the scraper.
+-- A4 (POS bigrams via wink-nlp) remains client-side only (JS-specific tagger).
+-- Updated after each AAT run; client uses this for instant ranking.
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS aat_author_scores (
@@ -41,14 +41,28 @@ CREATE TABLE IF NOT EXISTS aat_author_scores (
     a1_pct      SMALLINT,
     a2_pct      SMALLINT,
     a3_pct      SMALLINT,
-    agree_3     SMALLINT,   -- 0-3: how many of A1/A2/A3 passed
+    a5_pass     BOOLEAN,
+    a5_pct      SMALLINT,
+    a6_pass     BOOLEAN,
+    a6_auc      SMALLINT,
+    agree_3     SMALLINT,   -- 0-3: A1/A2/A3 (kept for backward compat)
+    agree_5     SMALLINT,   -- 0-5: A1/A2/A3/A5/A6 pre-computed total
     word_count  INTEGER,
+    subreddits  TEXT[]      DEFAULT '{}',
     computed_at TIMESTAMPTZ DEFAULT now()
 );
 
--- Fast ranking queries (agree descending, then word count)
+-- Migrations for existing deployments (safe to run on a live DB):
+-- ALTER TABLE aat_author_scores ADD COLUMN IF NOT EXISTS subreddits TEXT[] DEFAULT '{}';
+-- ALTER TABLE aat_author_scores ADD COLUMN IF NOT EXISTS a5_pass BOOLEAN;
+-- ALTER TABLE aat_author_scores ADD COLUMN IF NOT EXISTS a5_pct  SMALLINT;
+-- ALTER TABLE aat_author_scores ADD COLUMN IF NOT EXISTS a6_pass BOOLEAN;
+-- ALTER TABLE aat_author_scores ADD COLUMN IF NOT EXISTS a6_auc  SMALLINT;
+-- ALTER TABLE aat_author_scores ADD COLUMN IF NOT EXISTS agree_5 SMALLINT;
+
+-- Fast ranking queries (agree_5 descending, then word count)
 CREATE INDEX IF NOT EXISTS idx_aat_scores_ranking
-    ON aat_author_scores (agree_3 DESC, word_count DESC);
+    ON aat_author_scores (agree_5 DESC, word_count DESC);
 
 ALTER TABLE aat_author_scores ENABLE ROW LEVEL SECURITY;
 

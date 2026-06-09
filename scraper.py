@@ -21,6 +21,7 @@ import re
 import signal
 import sys
 import time
+import zlib
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -182,30 +183,109 @@ def _a3_score(chunks: list[str], ref_rates: list[float]) -> float:
     ) / n
 
 
-def _score_a1_a2_a3(text: str, model: dict) -> dict | None:
-    """Compute A1/A2/A3 scores. Returns None if text is too short to chunk."""
+def _ncd_similarity(samples: list[str], cand_text: str) -> float:
+    """A5: Normalized Compression Distance.
+    Mirrors ncdSimilarity() in crossplatform_analysis.js.
+    Uses zlib.compress (DEFLATE + zlib header) == CompressionStream('deflate') in Chrome."""
+    target_len = len(cand_text) * 1.5
+    sample = min(samples, key=lambda s: abs(len(s) - target_len))
+
+    def c_size(text: str) -> int:
+        return len(zlib.compress(text.encode('utf-8')))
+
+    cr  = c_size(sample)
+    cc  = c_size(cand_text)
+    crc = c_size(sample + ' ' + cand_text)
+    denom = max(cr, cc)
+    if denom == 0:
+        return 0.0
+    return max(0.0, 1.0 - (crc - min(cr, cc)) / denom)
+
+
+def _unmasking_curve(
+    chunks: list[str],
+    a3_ref_rates: list[float],
+    a6_impostors: list[float],
+    rounds: int = 6,
+    remove_per_round: int = 3,
+) -> dict:
+    """A6: Unmasking curve (Koppel 2007).
+    Mirrors unmaskingCurve() in crossplatform_analysis.js exactly.
+    Uses same _A3_PATTERNS order as A3_TESTS in JS."""
+    feat_idx = list(range(len(_A3_PATTERNS)))   # original indices, mirrors feats=[...A3_TESTS]
+    raw_curve: list[float] = []
+
+    for _ in range(rounds):
+        if len(feat_idx) <= remove_per_round + 1:
+            break
+        n = len(feat_idx)
+        cand_rates = [_presence_rate(chunks, _A3_PATTERNS[i]) for i in feat_idx]
+        ref_rates  = [a3_ref_rates[i] or 0.1 for i in feat_idx]  # mirrors JS: || 0.1
+
+        score = 1.0 - sum(
+            max(0.0, abs(cand_rates[j] - ref_rates[j]) / max(ref_rates[j], 0.05))
+            for j in range(n)
+        ) / n
+        raw_curve.append(score)
+
+        # Remove features with highest deviation (mirrors JS disc.sort + filter)
+        disc = sorted(range(n), key=lambda j: abs(cand_rates[j] - ref_rates[j]), reverse=True)
+        rm   = set(disc[:remove_per_round])
+        feat_idx = [feat_idx[j] for j in range(n) if j not in rm]
+
+    raw_auc  = sum(raw_curve) / len(raw_curve) if raw_curve else 0.0
+    raw_drop = (raw_curve[0] - raw_curve[-1]) if len(raw_curve) > 1 else 0.0
+
+    auc  = _pctile(raw_auc, a6_impostors)   # a6_impostors stores raw 0–1 values
+    drop = round(raw_drop * 100)
+    return {
+        'auc':    auc,
+        'drop':   drop,
+        'robust': auc >= 70 and drop < 30,
+    }
+
+
+def _score_precomputed(text: str, model: dict) -> dict | None:
+    """Compute A1/A2/A3/A5/A6 scores (all server-side analyses).
+    Returns None if text is too short to chunk.
+    A4 (POS bigrams via wink-nlp) remains client-side only."""
     chunks = _chunk_text(text)
     if not chunks:
         return None
 
+    # A1 — word length distribution (Mendenhall)
     a1s    = _cosine(_word_length_profile(chunks), model['a1Ref'])
     a1_pct = _pctile(a1s, model['a1Impostors'])
+    a1_pass = a1_pct >= _AAT_PASS_PCT
 
+    # A2 — function-word char n-grams (Overdorf & Greenstadt)
     a2s    = _cosine(_fw_profile(chunks, model['a2Vocab']), model['a2Ref'])
     a2_pct = _pctile(a2s, model['a2Impostors'])
+    a2_pass = a2_pct >= _AAT_PASS_PCT
 
+    # A3 — function-word presence rates (Koppel)
     a3s    = _a3_score(chunks, model['a3RefRates'])
     a3_pct = _pctile(a3s, model['a3Impostors'])
-
-    a1_pass = a1_pct >= _AAT_PASS_PCT
-    a2_pass = a2_pct >= _AAT_PASS_PCT
     a3_pass = a3_pct >= _AAT_PASS_PCT
+
+    # A5 — Normalized Compression Distance (Cilibrasi & Vitanyi)
+    a5s    = _ncd_similarity(model['a5Samples'], text)
+    a5_pct = _pctile(a5s, model['a5Impostors'])
+    a5_pass = a5_pct >= _AAT_PASS_PCT
+
+    # A6 — Unmasking curve (Koppel 2007)
+    a6     = _unmasking_curve(chunks, model['a3RefRates'], model['a6Impostors'])
+    a6_pass = a6['robust']
+    a6_auc  = a6['auc']
 
     return {
         'a1_pass': a1_pass, 'a1_pct': a1_pct,
         'a2_pass': a2_pass, 'a2_pct': a2_pct,
         'a3_pass': a3_pass, 'a3_pct': a3_pct,
-        'agree_3': sum([a1_pass, a2_pass, a3_pass]),
+        'a5_pass': a5_pass, 'a5_pct': a5_pct,
+        'a6_pass': a6_pass, 'a6_auc': a6_auc,
+        'agree_3': sum([a1_pass, a2_pass, a3_pass]),                           # kept for compat
+        'agree_5': sum([a1_pass, a2_pass, a3_pass, a5_pass, a6_pass]),         # pre-computed total
     }
 
 
@@ -788,11 +868,12 @@ def run_aat(supabase: Client, session: requests.Session, full: bool):
 
 def run_aat_scoring(supabase: Client, model: dict):
     """
-    Compute A1/A2/A3 stylometric scores for all qualified authors and upsert
+    Compute A1/A2/A3/A5/A6 stylometric scores for all qualified authors and upsert
     to aat_author_scores.  Only re-scores authors who have new content since
     their last computed_at, skipping unchanged ones for efficiency.
+    A4 (POS bigrams via wink-nlp) remains client-side only.
     """
-    log.info("=== AAT scoring — A1/A2/A3 pre-computation ===")
+    log.info("=== AAT scoring — A1/A2/A3/A5/A6 pre-computation ===")
 
     # 1. Load existing computed_at per author
     existing: dict[str, str] = {}
@@ -803,14 +884,14 @@ def run_aat_scoring(supabase: Client, model: dict):
     except Exception as e:
         log.warning("Could not load existing scores: %s", e)
 
-    # 2. Aggregate word counts and max inserted_at per author from metadata
+    # 2. Aggregate word counts, max inserted_at, and subreddits per author
     log.info("Aggregating author word counts...")
     author_meta: dict[str, dict] = {}
     offset, page = 0, 1000
     while True:
         resp = (
             supabase.table("aat_author_comments")
-            .select("author,word_count,inserted_at")
+            .select("author,word_count,inserted_at,subreddit")
             .range(offset, offset + page - 1)
             .execute()
         )
@@ -820,11 +901,14 @@ def run_aat_scoring(supabase: Client, model: dict):
             if not a or a == '[deleted]':
                 continue
             if a not in author_meta:
-                author_meta[a] = {'word_count': 0, 'max_inserted_at': ''}
+                author_meta[a] = {'word_count': 0, 'max_inserted_at': '', 'subreddits': set()}
             author_meta[a]['word_count'] += row.get('word_count') or 0
             ins = row.get('inserted_at') or ''
             if ins > author_meta[a]['max_inserted_at']:
                 author_meta[a]['max_inserted_at'] = ins
+            sub = row.get('subreddit') or ''
+            if sub:
+                author_meta[a]['subreddits'].add(sub)
         if len(rows) < page:
             break
         offset += page
@@ -879,21 +963,26 @@ def run_aat_scoring(supabase: Client, model: dict):
     scored_rows: list[dict] = []
     for author, word_count in to_score:
         text   = ' '.join(texts_by_author.get(author, []))
-        result = _score_a1_a2_a3(text, model)
+        result = _score_precomputed(text, model)
         if result is None:
             log.info("  Skipped %s — insufficient chunks after combining body", author)
             continue
         scored_rows.append({
             'author':      author,
             'word_count':  word_count,
+            'subreddits':  sorted(author_meta[author]['subreddits']),
             'computed_at': datetime.now(timezone.utc).isoformat(),
             **result,
         })
-        log.info("  Scored %-30s agree=%d/3  (A1:%s A2:%s A3:%s)",
-                 author, result['agree_3'],
-                 'P' if result['a1_pass'] else 'F',
-                 'P' if result['a2_pass'] else 'F',
-                 'P' if result['a3_pass'] else 'F')
+        log.info(
+            "  Scored %-30s agree=%d/5  (A1:%s A2:%s A3:%s A5:%s A6:%s)",
+            author, result['agree_5'],
+            'P' if result['a1_pass'] else 'F',
+            'P' if result['a2_pass'] else 'F',
+            'P' if result['a3_pass'] else 'F',
+            'P' if result['a5_pass'] else 'F',
+            'P' if result['a6_pass'] else 'F',
+        )
 
     n = upsert_in_chunks(supabase, "aat_author_scores", scored_rows, chunk=50, conflict_col="author")
     log.info("AAT scores upserted: %d", n)
@@ -939,80 +1028,4 @@ def run(full: bool, reindex_context: bool = False, skip_aat: bool = False, aat_o
 
         # ---- Thread context (Reddit JSON) ----
         known_post_ctx_ids    = get_existing_ids(supabase, "reddit_post_context")
-        known_comment_ctx_ids = get_existing_ids(supabase, "reddit_comment_context")
-        null_parent_ctx_ids, null_parent_post_ids = get_null_parent_context_comment_ids(supabase)
-
-        stored = supabase.table("reddit_comments").select("id,subreddit,link_id,parent_id").execute().data or []
-
-        ctx_mode = 'reindex' if reindex_context else False
-        if reindex_context:
-            all_for_ctx = stored
-        else:
-            posts_to_refresh = {
-                c.get("link_id", "").removeprefix("t3_")
-                for c in stored
-                if c.get("link_id", "").removeprefix("t3_") not in known_post_ctx_ids
-                or c.get("link_id", "").removeprefix("t3_") in null_parent_post_ids
-            }
-            comment_ids_seen = set()
-            all_for_ctx = []
-            for c in stored + new_comments:
-                cid = c.get("id")
-                if not cid or cid in comment_ids_seen:
-                    continue
-                post_id = c.get("link_id", "").removeprefix("t3_")
-                if post_id and post_id in posts_to_refresh:
-                    all_for_ctx.append(c)
-                    comment_ids_seen.add(cid)
-            all_for_ctx.extend([c for c in new_comments if c.get("id") not in comment_ids_seen])
-
-        post_ctx_rows, comment_ctx_rows = fetch_all_context(
-            all_for_ctx,
-            known_post_ctx_ids,
-            known_comment_ctx_ids,
-            ctx_mode,
-            session,
-            refresh_ctx_comment_ids=null_parent_ctx_ids,
-        )
-
-        n_posts = upsert_in_chunks(supabase, "reddit_post_context",    post_ctx_rows)
-        n_ctxc  = upsert_in_chunks(supabase, "reddit_comment_context", comment_ctx_rows)
-        log.info("Post context upserted: %d", n_posts)
-        log.info("Comment context upserted: %d", n_ctxc)
-
-        # ---- Posts (submitted) ----
-        known_post_ids = get_existing_ids(supabase, "reddit_posts")
-        new_posts: list[dict] = []
-
-        try:
-            for item in iter_arctic_posts(known_post_ids, full, session):
-                new_posts.append(item)
-        except _GracefulExit:
-            log.warning("Interrupted during EL posts. Flushing %d rows…", len(new_posts))
-            upsert_in_chunks(supabase, "reddit_posts", [map_post(p) for p in new_posts])
-            sys.exit(0)
-
-        n = upsert_in_chunks(supabase, "reddit_posts", [map_post(p) for p in new_posts])
-        log.info("Posts upserted: %d", n)
-
-    # ---- AAT ----
-    if not skip_aat:
-        run_aat(supabase, session, full)
-        run_aat_scoring(supabase, aat_model)
-
-    log.info("=== Done. ===")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Early Leopard + AAT Reddit scraper")
-    parser.add_argument("--full",            action="store_true", help="Full backfill (all comments, missing context only)")
-    parser.add_argument("--reindex-context", action="store_true", help="Re-fetch ALL thread context regardless of what's stored")
-    parser.add_argument("--skip-aat",        action="store_true", help="Skip AAT subreddit scraping (EL only)")
-    parser.add_argument("--aat-only",        action="store_true", help="Run AAT scraping only, skip EL")
-    args = parser.parse_args()
-    run(
-        full=args.full,
-        reindex_context=args.reindex_context,
-        skip_aat=args.skip_aat,
-        aat_only=args.aat_only,
-    )
+        known_comment_ctx_ids = get_exi
