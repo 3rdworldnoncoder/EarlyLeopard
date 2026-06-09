@@ -285,24 +285,20 @@ def _score_precomputed(text: str, model: dict) -> dict | None:
     a3_pct = _pctile(a3s, _select_baseline(model['a3Impostors'], n))
     a3_pass = a3_pct >= _AAT_PASS_PCT
 
-    # A5 — Normalized Compression Distance (Cilibrasi & Vitanyi)
-    a5s    = _ncd_similarity(model['a5Samples'], text)
-    a5_pct = _pctile(a5s, _select_baseline(model['a5Impostors'], n))
-    a5_pass = a5_pct >= _AAT_PASS_PCT
-
     # A6 — Unmasking curve (Koppel 2007)
     a6     = _unmasking_curve(chunks, model['a3RefRates'], _select_baseline(model['a6Impostors'], n))
     a6_pass = a6['robust']
     a6_auc  = a6['auc']
 
+    # A5 is now client-side only (browser NCD matches JS CompressionStream exactly).
+    # agree_5 column now stores A1+A2+A3+A6 (4 analyses); a5_pass left as-is in DB.
     return {
         'a1_pass': a1_pass, 'a1_pct': a1_pct,
         'a2_pass': a2_pass, 'a2_pct': a2_pct,
         'a3_pass': a3_pass, 'a3_pct': a3_pct,
-        'a5_pass': a5_pass, 'a5_pct': a5_pct,
         'a6_pass': a6_pass, 'a6_auc': a6_auc,
-        'agree_3': sum([a1_pass, a2_pass, a3_pass]),                           # kept for compat
-        'agree_5': sum([a1_pass, a2_pass, a3_pass, a5_pass, a6_pass]),         # pre-computed total
+        'agree_3': sum([a1_pass, a2_pass, a3_pass]),              # kept for compat
+        'agree_5': sum([a1_pass, a2_pass, a3_pass, a6_pass]),     # A1+A2+A3+A6 (4 server analyses)
     }
 
 
@@ -1036,12 +1032,11 @@ def run_aat_scoring(supabase: Client, model: dict, rescore_all: bool = False):
             **result,
         })
         log.info(
-            "  Scored %-30s agree=%d/5  (A1:%s A2:%s A3:%s A5:%s A6:%s)",
+            "  Scored %-30s agree=%d/4  (A1:%s A2:%s A3:%s A6:%s) [A4/A5 client-side]",
             author, result['agree_5'],
             'P' if result['a1_pass'] else 'F',
             'P' if result['a2_pass'] else 'F',
             'P' if result['a3_pass'] else 'F',
-            'P' if result['a5_pass'] else 'F',
             'P' if result['a6_pass'] else 'F',
         )
 
