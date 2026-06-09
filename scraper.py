@@ -884,14 +884,14 @@ def run_aat_scoring(supabase: Client, model: dict):
     except Exception as e:
         log.warning("Could not load existing scores: %s", e)
 
-    # 2. Aggregate word counts, max inserted_at, and subreddits per author
-    log.info("Aggregating author word counts...")
+    # 2. Aggregate word counts, max inserted_at, subreddits, and HoDS stats per author
+    log.info("Aggregating author metadata...")
     author_meta: dict[str, dict] = {}
     offset, page = 0, 1000
     while True:
         resp = (
             supabase.table("aat_author_comments")
-            .select("author,word_count,inserted_at,subreddit")
+            .select("author,word_count,inserted_at,subreddit,created_utc")
             .range(offset, offset + page - 1)
             .execute()
         )
@@ -901,14 +901,26 @@ def run_aat_scoring(supabase: Client, model: dict):
             if not a or a == '[deleted]':
                 continue
             if a not in author_meta:
-                author_meta[a] = {'word_count': 0, 'max_inserted_at': '', 'subreddits': set()}
+                author_meta[a] = {
+                    'word_count': 0, 'max_inserted_at': '', 'subreddits': set(),
+                    'item_count': 0, 'days': set(), 'posts_by_day': {}, 'night_count': 0,
+                }
             author_meta[a]['word_count'] += row.get('word_count') or 0
+            author_meta[a]['item_count'] += 1
             ins = row.get('inserted_at') or ''
             if ins > author_meta[a]['max_inserted_at']:
                 author_meta[a]['max_inserted_at'] = ins
             sub = row.get('subreddit') or ''
             if sub:
                 author_meta[a]['subreddits'].add(sub)
+            utc = row.get('created_utc')
+            if utc:
+                dt  = datetime.fromtimestamp(utc, tz=timezone.utc)
+                day = dt.strftime('%Y-%m-%d')
+                author_meta[a]['days'].add(day)
+                author_meta[a]['posts_by_day'][day] = author_meta[a]['posts_by_day'].get(day, 0) + 1
+                if 1 <= dt.hour <= 5:
+                    author_meta[a]['night_count'] += 1
         if len(rows) < page:
             break
         offset += page
@@ -930,6 +942,30 @@ def run_aat_scoring(supabase: Client, model: dict):
         "Qualified authors: %d — to score: %d, skipped (unchanged): %d",
         qualified_total, len(to_score), skipped,
     )
+
+    # 3b. Upsert HoDS activity stats for ALL qualified authors regardless of whether
+    #     their stylometric scores need recomputing. This ensures item_count,
+    #     distinct_days, max_posts_day, night_pct are always current, and populates
+    #     them on first deployment without requiring --rescore-all.
+    def _hods_stats(meta: dict) -> dict:
+        item_count    = meta['item_count']
+        distinct_days = len(meta['days'])
+        max_posts_day = max(meta['posts_by_day'].values()) if meta['posts_by_day'] else 0
+        night_pct     = round(meta['night_count'] / item_count * 100) if item_count else 0
+        return {
+            'item_count':    item_count,
+            'distinct_days': distinct_days,
+            'max_posts_day': max_posts_day,
+            'night_pct':     night_pct,
+        }
+
+    stats_rows = [
+        {'author': a, **_hods_stats(m)}
+        for a, m in author_meta.items()
+        if m['word_count'] >= _AAT_MIN_WORDS
+    ]
+    upsert_in_chunks(supabase, "aat_author_scores", stats_rows, chunk=100, conflict_col="author")
+    log.info("HoDS stats upserted for %d authors", len(stats_rows))
 
     # 4. Fetch body text for all qualified authors in batched IN queries
     #    (one request per batch instead of one per author)
@@ -972,6 +1008,7 @@ def run_aat_scoring(supabase: Client, model: dict):
             'word_count':  word_count,
             'subreddits':  sorted(author_meta[author]['subreddits']),
             'computed_at': datetime.now(timezone.utc).isoformat(),
+            **_hods_stats(author_meta[author]),
             **result,
         })
         log.info(

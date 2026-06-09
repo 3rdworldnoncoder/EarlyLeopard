@@ -45,11 +45,15 @@ CREATE TABLE IF NOT EXISTS aat_author_scores (
     a5_pct      SMALLINT,
     a6_pass     BOOLEAN,
     a6_auc      SMALLINT,
-    agree_3     SMALLINT,   -- 0-3: A1/A2/A3 (kept for backward compat)
-    agree_5     SMALLINT,   -- 0-5: A1/A2/A3/A5/A6 pre-computed total
-    word_count  INTEGER,
-    subreddits  TEXT[]      DEFAULT '{}',
-    computed_at TIMESTAMPTZ DEFAULT now()
+    agree_3       SMALLINT,   -- 0-3: A1/A2/A3 (kept for backward compat)
+    agree_5       SMALLINT,   -- 0-5: A1/A2/A3/A5/A6 pre-computed total
+    word_count    INTEGER,
+    subreddits    TEXT[]      DEFAULT '{}',
+    item_count    INTEGER,    -- total posts + comments scraped
+    max_posts_day SMALLINT,   -- peak posts in a single calendar day (UTC)
+    night_pct     SMALLINT,   -- % of posts made 01:00-05:59 UTC
+    distinct_days SMALLINT,   -- number of distinct days with at least one post
+    computed_at   TIMESTAMPTZ DEFAULT now()
 );
 
 -- Migrations for existing deployments (safe to run on a live DB):
@@ -59,6 +63,10 @@ CREATE TABLE IF NOT EXISTS aat_author_scores (
 -- ALTER TABLE aat_author_scores ADD COLUMN IF NOT EXISTS a6_pass BOOLEAN;
 -- ALTER TABLE aat_author_scores ADD COLUMN IF NOT EXISTS a6_auc  SMALLINT;
 -- ALTER TABLE aat_author_scores ADD COLUMN IF NOT EXISTS agree_5 SMALLINT;
+-- ALTER TABLE aat_author_scores ADD COLUMN IF NOT EXISTS item_count    INTEGER;
+-- ALTER TABLE aat_author_scores ADD COLUMN IF NOT EXISTS max_posts_day SMALLINT;
+-- ALTER TABLE aat_author_scores ADD COLUMN IF NOT EXISTS night_pct     SMALLINT;
+-- ALTER TABLE aat_author_scores ADD COLUMN IF NOT EXISTS distinct_days SMALLINT;
 
 -- Fast ranking queries (agree_5 descending, then word count)
 CREATE INDEX IF NOT EXISTS idx_aat_scores_ranking
