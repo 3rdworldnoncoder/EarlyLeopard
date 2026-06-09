@@ -13,7 +13,9 @@ Usage:
 """
 
 import argparse
+import json
 import logging
+import math
 import os
 import re
 import signal
@@ -51,6 +53,167 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# AAT Stylometry — A1, A2, A3 (pure Python, no NLP dependencies)
+# Mirrors crossplatform_analysis.js. A4-A6 remain client-side only.
+# ---------------------------------------------------------------------------
+
+_AAT_CHUNK_WORDS = 80
+_AAT_PASS_PCT    = 75
+_AAT_MIN_WORDS   = 500   # mirrors MIN_WORDS in AATTab.jsx
+
+_FUNCTION_WORDS = {
+    'the','a','an','i','you','he','she','it','we','they','me','him','her','us','them',
+    'my','your','his','its','our','their','this','that','these','those',
+    'is','am','are','was','were','be','been','being','have','has','had','do','does','did',
+    'will','would','could','should','may','might','shall','can','must','not',
+    'in','on','at','by','for','with','about','to','from','of','and','but','or','so',
+    'as','if','then','when','where','which','who','what','how',
+}
+
+# Order must match a3RefRates in crossplatform_model.json
+_A3_PATTERNS = [
+    re.compile(r'\bdont\b'),
+    re.compile(r':'),
+    re.compile(r"\bdidn't\b", re.I),
+    re.compile(r'\bsaid\b', re.I),
+    re.compile(r'\bliterally\b', re.I),
+    re.compile(r'\bdidnt\b'),
+    re.compile(r'\blmao\b', re.I),
+    re.compile(r"\bit's\b", re.I),
+    re.compile(r'\.\.\.'),
+    re.compile(r"\bwasn't\b", re.I),
+    re.compile(r'\bthis is\b', re.I),
+    re.compile(r'\bbecause\b', re.I),
+    re.compile(r'(?:^|[.!?]\s+)Also\b'),
+    re.compile(r'(?:^|[.!?]\s+)It\b'),
+    re.compile(r'(?:^|[.!?]\s+)You\b'),
+    re.compile(r"\bisn't\b", re.I),
+    re.compile(r'\btrue\b', re.I),
+    re.compile(r'\bi would\b', re.I),
+    re.compile(r'\byeah?\b', re.I),
+    re.compile(r"\bthere's\b", re.I),
+    re.compile(r'\blol\b', re.I),
+    re.compile(r'\bsort of\b', re.I),
+]
+
+
+def _aat_tokenize(text: str) -> list[str]:
+    text = re.sub(r'https?://\S+', '', text)
+    text = re.sub(r'@\w+', '', text)
+    text = re.sub(r"[^a-zA-Z']", ' ', text)
+    return [w.lower() for w in text.split() if w]
+
+
+def _normalize(vec: list[float]) -> list[float]:
+    n = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [v / n for v in vec]
+
+
+def _chunk_text(text: str) -> list[str]:
+    tokens = text.split()
+    return [
+        ' '.join(tokens[i:i + _AAT_CHUNK_WORDS])
+        for i in range(0, len(tokens) - _AAT_CHUNK_WORDS + 1, _AAT_CHUNK_WORDS)
+    ]
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na  = math.sqrt(sum(x * x for x in a))
+    nb  = math.sqrt(sum(x * x for x in b))
+    return dot / (na * nb) if na and nb else 0.0
+
+
+def _pctile(score: float, sorted_list: list[float]) -> int:
+    if not sorted_list:
+        return 50
+    return round(sum(1 for s in sorted_list if s < score) / len(sorted_list) * 100)
+
+
+def _word_length_profile(chunks: list[str]) -> list[float]:
+    dist = [0] * 15
+    total = 0
+    for c in chunks:
+        for w in _aat_tokenize(c):
+            length = min(len(w.replace("'", '')), 15)
+            if length > 0:
+                dist[length - 1] += 1
+                total += 1
+    if not total:
+        return [0.0] * 15
+    return _normalize([c / total for c in dist])
+
+
+def _fw_ngrams(text: str, n: int = 3) -> dict[str, int]:
+    words = [w for w in _aat_tokenize(text) if w in _FUNCTION_WORDS]
+    s = ' ' + ' '.join(words) + ' '
+    counts: dict[str, int] = {}
+    for i in range(len(s) - n + 1):
+        g = s[i:i + n]
+        counts[g] = counts.get(g, 0) + 1
+    return counts
+
+
+def _fw_profile(chunks: list[str], vocab: list[str]) -> list[float]:
+    vocab_set = set(vocab)
+    counts: dict[str, int] = {}
+    for c in chunks:
+        for g, v in _fw_ngrams(c).items():
+            if g in vocab_set:
+                counts[g] = counts.get(g, 0) + v
+    total = sum(counts.values()) or 1
+    return _normalize([counts.get(g, 0) / total for g in vocab])
+
+
+def _presence_rate(chunks: list[str], pattern: re.Pattern) -> float:
+    if not chunks:
+        return 0.0
+    return sum(1 for c in chunks if pattern.search(c)) / len(chunks)
+
+
+def _a3_score(chunks: list[str], ref_rates: list[float]) -> float:
+    rates = [_presence_rate(chunks, pat) for pat in _A3_PATTERNS]
+    n = len(rates)
+    return 1.0 - sum(
+        max(0.0, abs(r - ref) / max(ref, 0.05))
+        for r, ref in zip(rates, ref_rates)
+    ) / n
+
+
+def _score_a1_a2_a3(text: str, model: dict) -> dict | None:
+    """Compute A1/A2/A3 scores. Returns None if text is too short to chunk."""
+    chunks = _chunk_text(text)
+    if not chunks:
+        return None
+
+    a1s    = _cosine(_word_length_profile(chunks), model['a1Ref'])
+    a1_pct = _pctile(a1s, model['a1Impostors'])
+
+    a2s    = _cosine(_fw_profile(chunks, model['a2Vocab']), model['a2Ref'])
+    a2_pct = _pctile(a2s, model['a2Impostors'])
+
+    a3s    = _a3_score(chunks, model['a3RefRates'])
+    a3_pct = _pctile(a3s, model['a3Impostors'])
+
+    a1_pass = a1_pct >= _AAT_PASS_PCT
+    a2_pass = a2_pct >= _AAT_PASS_PCT
+    a3_pass = a3_pct >= _AAT_PASS_PCT
+
+    return {
+        'a1_pass': a1_pass, 'a1_pct': a1_pct,
+        'a2_pass': a2_pass, 'a2_pct': a2_pct,
+        'a3_pass': a3_pass, 'a3_pct': a3_pct,
+        'agree_3': sum([a1_pass, a2_pass, a3_pass]),
+    }
+
+
+def load_aat_model() -> dict:
+    """Load A1/A2/A3 model data from crossplatform_model.json (same directory)."""
+    path = os.path.join(os.path.dirname(__file__), 'crossplatform_model.json')
+    with open(path, encoding='utf-8') as f:
+        return json.load(f)
 
 # ---------------------------------------------------------------------------
 # Arctic Shift — generic paginated comment/post iterators
@@ -483,12 +646,12 @@ def fetch_and_store_audio(supabase: Client, post_id: str, video_url: str | None,
         return None
 
 
-def upsert_in_chunks(supabase: Client, table: str, rows: list[dict], chunk: int = 100) -> int:
+def upsert_in_chunks(supabase: Client, table: str, rows: list[dict], chunk: int = 100, conflict_col: str = "id") -> int:
     total = 0
     for i in range(0, len(rows), chunk):
         batch = rows[i:i + chunk]
         if batch:
-            supabase.table(table).upsert(batch, on_conflict="id").execute()
+            supabase.table(table).upsert(batch, on_conflict=conflict_col).execute()
             total += len(batch)
     return total
 
@@ -567,7 +730,15 @@ def run_aat(supabase: Client, session: requests.Session, full: bool):
 
     log.info("=== AAT scraper — %s ===", label)
 
-    known_aat_ids = get_existing_ids(supabase, "aat_author_comments")
+    # In incremental mode the after_utc cursor already positions us at new
+    # content, so loading all existing IDs is redundant — upsert handles any
+    # duplicate edge cases (same-second timestamps).  Full mode still needs
+    # the set to skip already-stored items and for the early-stop logic.
+    if full:
+        known_aat_ids = get_existing_ids(supabase, "aat_author_comments")
+    else:
+        known_aat_ids = set()
+
     new_rows: list[dict] = []
 
     try:
@@ -615,6 +786,119 @@ def run_aat(supabase: Client, session: requests.Session, full: bool):
     log.info("AAT items upserted: %d", n)
 
 
+def run_aat_scoring(supabase: Client, model: dict):
+    """
+    Compute A1/A2/A3 stylometric scores for all qualified authors and upsert
+    to aat_author_scores.  Only re-scores authors who have new content since
+    their last computed_at, skipping unchanged ones for efficiency.
+    """
+    log.info("=== AAT scoring — A1/A2/A3 pre-computation ===")
+
+    # 1. Load existing computed_at per author
+    existing: dict[str, str] = {}
+    try:
+        resp = supabase.table("aat_author_scores").select("author,computed_at").execute()
+        for row in (resp.data or []):
+            existing[row['author']] = row.get('computed_at') or ''
+    except Exception as e:
+        log.warning("Could not load existing scores: %s", e)
+
+    # 2. Aggregate word counts and max inserted_at per author from metadata
+    log.info("Aggregating author word counts...")
+    author_meta: dict[str, dict] = {}
+    offset, page = 0, 1000
+    while True:
+        resp = (
+            supabase.table("aat_author_comments")
+            .select("author,word_count,inserted_at")
+            .range(offset, offset + page - 1)
+            .execute()
+        )
+        rows = resp.data or []
+        for row in rows:
+            a = row.get('author')
+            if not a or a == '[deleted]':
+                continue
+            if a not in author_meta:
+                author_meta[a] = {'word_count': 0, 'max_inserted_at': ''}
+            author_meta[a]['word_count'] += row.get('word_count') or 0
+            ins = row.get('inserted_at') or ''
+            if ins > author_meta[a]['max_inserted_at']:
+                author_meta[a]['max_inserted_at'] = ins
+        if len(rows) < page:
+            break
+        offset += page
+
+    # 3. Determine which authors need (re-)scoring
+    to_score = []
+    skipped  = 0
+    for author, meta in author_meta.items():
+        if meta['word_count'] < _AAT_MIN_WORDS:
+            continue
+        computed_at = existing.get(author, '')
+        if computed_at and meta['max_inserted_at'] <= computed_at:
+            skipped += 1
+            continue   # no new content since last score
+        to_score.append((author, meta['word_count']))
+
+    qualified_total = sum(1 for m in author_meta.values() if m['word_count'] >= _AAT_MIN_WORDS)
+    log.info(
+        "Qualified authors: %d — to score: %d, skipped (unchanged): %d",
+        qualified_total, len(to_score), skipped,
+    )
+
+    # 4. Fetch body text for all qualified authors in batched IN queries
+    #    (one request per batch instead of one per author)
+    AUTHOR_BATCH = 50
+    texts_by_author: dict[str, list[str]] = {a: [] for a, _ in to_score}
+    qualified_authors = list(texts_by_author.keys())
+
+    for batch_start in range(0, len(qualified_authors), AUTHOR_BATCH):
+        batch = qualified_authors[batch_start:batch_start + AUTHOR_BATCH]
+        offset, row_page = 0, 1000
+        while True:
+            resp = (
+                supabase.table("aat_author_comments")
+                .select("author,body")
+                .in_("author", batch)
+                .range(offset, offset + row_page - 1)
+                .execute()
+            )
+            rows = resp.data or []
+            for row in rows:
+                a = row.get('author')
+                if a in texts_by_author:
+                    texts_by_author[a].append(row.get('body') or '')
+            if len(rows) < row_page:
+                break
+            offset += row_page
+        log.info("  Fetched body for authors %d-%d of %d",
+                 batch_start + 1, batch_start + len(batch), len(qualified_authors))
+
+    # 5. Score each author from collected text
+    scored_rows: list[dict] = []
+    for author, word_count in to_score:
+        text   = ' '.join(texts_by_author.get(author, []))
+        result = _score_a1_a2_a3(text, model)
+        if result is None:
+            log.info("  Skipped %s — insufficient chunks after combining body", author)
+            continue
+        scored_rows.append({
+            'author':      author,
+            'word_count':  word_count,
+            'computed_at': datetime.now(timezone.utc).isoformat(),
+            **result,
+        })
+        log.info("  Scored %-30s agree=%d/3  (A1:%s A2:%s A3:%s)",
+                 author, result['agree_3'],
+                 'P' if result['a1_pass'] else 'F',
+                 'P' if result['a2_pass'] else 'F',
+                 'P' if result['a3_pass'] else 'F')
+
+    n = upsert_in_chunks(supabase, "aat_author_scores", scored_rows, chunk=50, conflict_col="author")
+    log.info("AAT scores upserted: %d", n)
+
+
 # ---------------------------------------------------------------------------
 # Main — Early Leopard
 # ---------------------------------------------------------------------------
@@ -625,6 +909,7 @@ def run(full: bool, reindex_context: bool = False, skip_aat: bool = False, aat_o
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     session  = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
+    aat_model = load_aat_model()
 
     if not aat_only:
         # mode string for logging
@@ -713,6 +998,7 @@ def run(full: bool, reindex_context: bool = False, skip_aat: bool = False, aat_o
     # ---- AAT ----
     if not skip_aat:
         run_aat(supabase, session, full)
+        run_aat_scoring(supabase, aat_model)
 
     log.info("=== Done. ===")
 
