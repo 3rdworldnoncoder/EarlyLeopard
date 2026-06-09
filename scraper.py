@@ -1028,4 +1028,80 @@ def run(full: bool, reindex_context: bool = False, skip_aat: bool = False, aat_o
 
         # ---- Thread context (Reddit JSON) ----
         known_post_ctx_ids    = get_existing_ids(supabase, "reddit_post_context")
-        known_comment_ctx_ids = get_exi
+        known_comment_ctx_ids = get_existing_ids(supabase, "reddit_comment_context")
+        null_parent_ctx_ids, null_parent_post_ids = get_null_parent_context_comment_ids(supabase)
+
+        stored = supabase.table("reddit_comments").select("id,subreddit,link_id,parent_id").execute().data or []
+
+        ctx_mode = 'reindex' if reindex_context else False
+        if reindex_context:
+            all_for_ctx = stored
+        else:
+            posts_to_refresh = {
+                c.get("link_id", "").removeprefix("t3_")
+                for c in stored
+                if c.get("link_id", "").removeprefix("t3_") not in known_post_ctx_ids
+                or c.get("link_id", "").removeprefix("t3_") in null_parent_post_ids
+            }
+            comment_ids_seen = set()
+            all_for_ctx = []
+            for c in stored + new_comments:
+                cid = c.get("id")
+                if not cid or cid in comment_ids_seen:
+                    continue
+                post_id = c.get("link_id", "").removeprefix("t3_")
+                if post_id and post_id in posts_to_refresh:
+                    all_for_ctx.append(c)
+                    comment_ids_seen.add(cid)
+            all_for_ctx.extend([c for c in new_comments if c.get("id") not in comment_ids_seen])
+
+        post_ctx_rows, comment_ctx_rows = fetch_all_context(
+            all_for_ctx,
+            known_post_ctx_ids,
+            known_comment_ctx_ids,
+            ctx_mode,
+            session,
+            refresh_ctx_comment_ids=null_parent_ctx_ids,
+        )
+
+        n_posts = upsert_in_chunks(supabase, "reddit_post_context",    post_ctx_rows)
+        n_ctxc  = upsert_in_chunks(supabase, "reddit_comment_context", comment_ctx_rows)
+        log.info("Post context upserted: %d", n_posts)
+        log.info("Comment context upserted: %d", n_ctxc)
+
+        # ---- Posts (submitted) ----
+        known_post_ids = get_existing_ids(supabase, "reddit_posts")
+        new_posts: list[dict] = []
+
+        try:
+            for item in iter_arctic_posts(known_post_ids, full, session):
+                new_posts.append(item)
+        except _GracefulExit:
+            log.warning("Interrupted during EL posts. Flushing %d rows…", len(new_posts))
+            upsert_in_chunks(supabase, "reddit_posts", [map_post(p) for p in new_posts])
+            sys.exit(0)
+
+        n = upsert_in_chunks(supabase, "reddit_posts", [map_post(p) for p in new_posts])
+        log.info("Posts upserted: %d", n)
+
+    # ---- AAT ----
+    if not skip_aat:
+        run_aat(supabase, session, full)
+        run_aat_scoring(supabase, aat_model)
+
+    log.info("=== Done. ===")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Early Leopard + AAT Reddit scraper")
+    parser.add_argument("--full",            action="store_true", help="Full backfill (all comments, missing context only)")
+    parser.add_argument("--reindex-context", action="store_true", help="Re-fetch ALL thread context regardless of what's stored")
+    parser.add_argument("--skip-aat",        action="store_true", help="Skip AAT subreddit scraping (EL only)")
+    parser.add_argument("--aat-only",        action="store_true", help="Run AAT scraping only, skip EL")
+    args = parser.parse_args()
+    run(
+        full=args.full,
+        reindex_context=args.reindex_context,
+        skip_aat=args.skip_aat,
+        aat_only=args.aat_only,
+    )
