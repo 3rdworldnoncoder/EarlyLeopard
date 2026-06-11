@@ -781,6 +781,29 @@ def _aat_skip(author: str, body: str) -> bool:
     return False
 
 
+def get_table_cursor(supabase: Client, table: str) -> int | None:
+    """
+    Returns the max created_utc stored in the given table, or None if empty.
+    Used as the starting cursor for incremental runs.
+    """
+    try:
+        resp = (
+            supabase.table(table)
+            .select("created_utc")
+            .order("created_utc", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = resp.data or []
+        if rows and rows[0].get("created_utc"):
+            ts = int(rows[0]["created_utc"])
+            log.info("%s incremental cursor: %d (%s)", table, ts, datetime.fromtimestamp(ts, tz=timezone.utc).isoformat())
+            return ts
+    except Exception as e:
+        log.warning("Could not fetch cursor for %s: %s", table, e)
+    return None
+
+
 def get_aat_cursor(supabase: Client) -> int | None:
     """
     Returns the max created_utc stored in aat_author_comments, or None if empty.
@@ -1071,8 +1094,9 @@ def run(full: bool, reindex_context: bool = False, skip_aat: bool = False, aat_o
         new_comments: list[dict] = []
 
         if not reindex_context:
+            el_comment_cursor = None if full else get_table_cursor(supabase, "reddit_comments")
             try:
-                for item in iter_arctic_comments(known_comment_ids, full, session):
+                for item in iter_arctic_comments(known_comment_ids, full, session, after_utc=el_comment_cursor):
                     new_comments.append(item)
             except _GracefulExit:
                 log.warning("Interrupted during EL comments. Flushing %d rows…", len(new_comments))
@@ -1129,8 +1153,9 @@ def run(full: bool, reindex_context: bool = False, skip_aat: bool = False, aat_o
         known_post_ids = get_existing_ids(supabase, "reddit_posts")
         new_posts: list[dict] = []
 
+        el_post_cursor = None if full else get_table_cursor(supabase, "reddit_posts")
         try:
-            for item in iter_arctic_posts(known_post_ids, full, session):
+            for item in iter_arctic_posts(known_post_ids, full, session, after_utc=el_post_cursor):
                 new_posts.append(item)
         except _GracefulExit:
             log.warning("Interrupted during EL posts. Flushing %d rows…", len(new_posts))
