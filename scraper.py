@@ -581,6 +581,7 @@ def fetch_thread(subreddit: str, post_id: str, session: requests.Session) -> tup
 
 
 def fetch_all_context(
+    supabase: Client,
     comments: list[dict],
     known_post_ids: set,
     known_ctx_comment_ids: set,
@@ -1136,6 +1137,7 @@ def run(full: bool, reindex_context: bool = False, skip_aat: bool = False, aat_o
             all_for_ctx.extend([c for c in new_comments if c.get("id") not in comment_ids_seen])
 
         post_ctx_rows, comment_ctx_rows = fetch_all_context(
+            supabase,
             all_for_ctx,
             known_post_ctx_ids,
             known_comment_ctx_ids,
